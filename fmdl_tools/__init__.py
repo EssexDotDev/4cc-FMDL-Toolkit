@@ -3,15 +3,16 @@
 bl_info = {
 	"name": "FMDL tools",
 	"author": "EssexDotDev",
-	"version": (1, 1, 0),
+	"version": (1, 2, 0),
 	"blender": (5, 2, 0),
 	"location": "View3D > Sidebar > FMDL tools",
-	"description": "Merge gloves onto a body, and put a mesh on the PES medic skeleton",
+	"description": "Merge gloves onto a body, put a mesh on the PES medic skeleton, and pack a body.dds atlas",
 	"category": "Object",
 }
 
 import bpy
 
+from .atlas import build_body_atlas
 from .merge import merge_gloves, selection_summary
 from .retarget import retarget_to_pes, transfer_boneless_to_pes
 
@@ -146,6 +147,42 @@ class FMDLTOOLS_OT_boneless_pes(bpy.types.Operator):
 		return {"FINISHED"}
 
 
+class FMDLTOOLS_OT_atlas(bpy.types.Operator):
+	bl_idname = "fmdltools.build_atlas"
+	bl_label = "Build body texture atlas"
+	bl_description = (
+		"Pack each material's color texture into one 2048 body.dds and move that material's UVs "
+		"into the same rectangle. This is the Photoshop step from the Kearsarge sheet: one scale "
+		"and move per texture, not a hand-arranged layout. Toon and sphere maps are left alone. "
+		"Run it while the UVs still sit in each texture's own 0-1 space. "
+		"A 2048 texture usually lands around a third of its size, because several of them share one sheet"
+	)
+	bl_options = {"REGISTER", "UNDO"}
+
+	@classmethod
+	def poll(cls, context):
+		return bool(context.selected_objects)
+
+	def execute(self, context):
+		try:
+			result = build_body_atlas(context)
+		except (ValueError, RuntimeError) as error:
+			self.report({"ERROR"}, str(error))
+			return {"CANCELLED"}
+		sizes = ", ".join("%s %d→%d" % (name, src, dst) for name, src, dst in result["slots"][:6])
+		note = (" " + result["note"]) if result["note"] else ""
+		skipped = ""
+		if result["missing"]:
+			skipped = " Skipped materials with no texture: %s." % ", ".join(result["missing"][:4])
+		self.report(
+			{"INFO"},
+			"Packed %d texture(s) at %.0f%% into %s. %s.%s%s" % (
+				result["textures"], result["scale"] * 100.0, result["dds"], sizes, skipped, note,
+			),
+		)
+		return {"FINISHED"}
+
+
 class FMDLTOOLS_PT_main(bpy.types.Panel):
 	bl_idname = "FMDLTOOLS_PT_main"
 	bl_label = "FMDL tools"
@@ -165,6 +202,8 @@ class FMDLTOOLS_PT_main(bpy.types.Panel):
 		layout.prop(prefs, "medic_fmdl", text="Medic FMDL")
 		layout.operator("fmdltools.retarget_pes", text="Convert existing Skeleton to PES Skeleton")
 		layout.operator("fmdltools.boneless_pes", text="Convert \U0001F171oneless Model to PES Skeleton")
+		layout.separator()
+		layout.operator("fmdltools.build_atlas", text="Build body texture atlas")
 
 
 CLASSES = (
@@ -172,6 +211,7 @@ CLASSES = (
 	FMDLTOOLS_OT_merge_gloves,
 	FMDLTOOLS_OT_retarget_pes,
 	FMDLTOOLS_OT_boneless_pes,
+	FMDLTOOLS_OT_atlas,
 	FMDLTOOLS_PT_main,
 )
 

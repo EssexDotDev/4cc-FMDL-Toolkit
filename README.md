@@ -7,6 +7,7 @@ The sidebar tab is **FMDL tools**.
 - Merge glove meshes onto a body.
 - Convert an existing skeleton onto the PES medic skeleton.
 - Convert a mesh with no vertex groups onto the PES medic skeleton by copying weights from the medic body.
+- Pack each material's color texture into one 2048 `body.dds` and move the UVs into that sheet.
 
 ## Install
 
