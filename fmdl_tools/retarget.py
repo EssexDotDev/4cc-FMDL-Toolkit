@@ -2050,3 +2050,280 @@ def retarget_to_pes(context, medic_path):
 		"scale": fit["scale"],
 		"arms": arm_scales,
 	}
+
+
+def _seg_dist(point, start, end):
+	span = end - start
+	length = span.length
+	if length < 1e-6:
+		return (point - start).length
+	t = max(0.0, min(1.0, (point - start).dot(span) / (length * length)))
+	return (point - (start + span * t)).length
+
+
+def _read_weights(mesh):
+	index_of = {group.index: group.name for group in mesh.vertex_groups}
+	weights = {}
+	for vertex in mesh.data.vertices:
+		bucket = {}
+		for item in vertex.groups:
+			name = index_of.get(item.group)
+			if name and item.weight > 0.0001:
+				bucket[name] = item.weight
+		if bucket:
+			weights[vertex.index] = bucket
+	return weights
+
+
+def _spine_dist(point, joints):
+	best = None
+	for joint in joints:
+		dist = (point - joint).length
+		if best is None or dist < best:
+			best = dist
+	for start, end in zip(joints, joints[1:]):
+		dist = _seg_dist(point, start, end)
+		if best is None or dist < best:
+			best = dist
+	return best if best is not None else 0.0
+
+
+def drape_cloth(context):
+	"""Share a coat or skirt across the torso and the limb it lies on.
+
+	Aqua paints a skirt from the hip onto the thigh and then the calf.
+	A cape over an arm gets the same idea: chest at the shoulder, the
+	upper arm along the sleeve, the forearm further out, and the hip
+	where the cloth hangs free. This does not rerun the convert.
+	"""
+	pes_arm = find_pes_armature(context)
+	if pes_arm is None:
+		raise ValueError("The PES skeleton is not in this scene. Convert the model first.")
+	mesh = None
+	for obj in context.selected_objects:
+		if obj.type == "MESH" and _driven_by(obj, pes_arm):
+			mesh = obj
+			break
+	if mesh is None:
+		driven = [
+			obj for obj in context.scene.objects
+			if obj.type == "MESH" and _driven_by(obj, pes_arm)
+		]
+		if not driven:
+			raise ValueError("Select the converted body.")
+		mesh = max(driven, key=lambda obj: len(obj.data.vertices))
+	weights = _read_weights(mesh)
+	if not weights:
+		raise ValueError("This mesh has no vertex groups. Convert it onto the PES skeleton first.")
+	matrix = mesh.matrix_world
+	inverse = matrix.inverted()
+	segments = []
+	for start_name, end_name, bone_name, kind in (
+		("dsk_upperarm_l", "sk_forearm_l", "dsk_upperarm_l", "arm"),
+		("sk_forearm_l", "sk_hand_l", "sk_forearm_l", "arm"),
+		("dsk_upperarm_r", "sk_forearm_r", "dsk_upperarm_r", "arm"),
+		("sk_forearm_r", "sk_hand_r", "sk_forearm_r", "arm"),
+		("sk_thigh_l", "sk_leg_l", "sk_thigh_l", "leg"),
+		("sk_leg_l", "sk_foot_l", "sk_leg_l", "leg"),
+		("sk_thigh_r", "sk_leg_r", "sk_thigh_r", "leg"),
+		("sk_leg_r", "sk_foot_r", "sk_leg_r", "leg"),
+	):
+		start = _bone_world(pes_arm, start_name)
+		end = _bone_world(pes_arm, end_name)
+		if start is None or end is None:
+			continue
+		segments.append((start, end, bone_name, kind))
+	spine = [
+		joint for joint in (
+			_bone_world(pes_arm, "dsk_hip"),
+			_bone_world(pes_arm, "sk_belly"),
+			_bone_world(pes_arm, "sk_chest"),
+			_bone_world(pes_arm, "sk_neck"),
+		)
+		if joint is not None
+	]
+	hip = _bone_world(pes_arm, "dsk_hip") or Vector((0.0, 0.0, 0.9))
+	chest = _bone_world(pes_arm, "sk_chest") or Vector((0.0, 0.0, 1.2))
+	# A tail behind the body stays on the hip. A cape over an arm does not.
+	tail = _hanging_appendage(mesh, pes_arm)
+	torso_names = ("dsk_hip", "sk_belly", "sk_chest")
+	body_names = (
+		"sk_head", "sk_neck",
+		"dsk_upperarm_l", "dsk_upperarm_r", "sk_upperarm_l", "sk_upperarm_r",
+		"sk_forearm_l", "sk_forearm_r", "dsk_forearm_l", "dsk_forearm_r",
+		"sk_hand_l", "sk_hand_r",
+		"sk_thigh_l", "sk_thigh_r", "sk_leg_l", "sk_leg_r",
+		"sk_foot_l", "sk_foot_r", "dsk_toe_l", "dsk_toe_r",
+	)
+	painted = 0
+	seated = 0
+	arm_roots = []
+	for index, bucket in list(weights.items()):
+		if index in tail:
+			continue
+		torso = sum(bucket.get(name, 0.0) for name in torso_names)
+		if torso < 0.45:
+			continue
+		if any(bucket.get(name, 0.0) >= 0.45 for name in body_names):
+			continue
+		point = matrix @ mesh.data.vertices[index].co
+		if _spine_dist(point, spine) < 0.13:
+			continue
+		nearest = []
+		for start, end, bone_name, kind in segments:
+			nearest.append((_seg_dist(point, start, end), bone_name, kind, start, end))
+		nearest.sort(key=lambda item: item[0])
+		if not nearest:
+			continue
+		dist, bone_name, kind, _start, _end = nearest[0]
+		# The part laid over the arm is out past the shoulder. Seat it on
+		# that bone and let the chest keep a share, so the cape is not rigid.
+		side_name = "l" if point.x >= 0.0 else "r"
+		sign = 1.0 if side_name == "l" else -1.0
+		shoulder = _bone_world(pes_arm, "dsk_upperarm_%s" % side_name)
+		elbow = _bone_world(pes_arm, "sk_forearm_%s" % side_name)
+		hand = _bone_world(pes_arm, "sk_hand_%s" % side_name)
+		over_arm = (
+			kind == "arm"
+			and shoulder is not None
+			and hand is not None
+			and point.z > hip.z + 0.05
+			and point.x * sign > shoulder.x * sign + 0.04
+			and dist < 0.42
+		)
+		if over_arm:
+			span = hand.x - shoulder.x
+			t = 0.0 if abs(span) < 1e-4 else (point.x - shoulder.x) / span
+			t = max(0.0, min(1.0, t))
+			center = shoulder + (hand - shoulder) * t
+			arm_dir = hand - shoulder
+			if arm_dir.length < 1e-4:
+				continue
+			arm_dir.normalize()
+			up = Vector((0.0, 0.0, 1.0))
+			side_axis = arm_dir.cross(up)
+			if side_axis.length < 1e-4:
+				side_axis = Vector((0.0, 1.0, 0.0))
+			side_axis.normalize()
+			hang_axis = side_axis.cross(arm_dir)
+			if hang_axis.z < 0.0:
+				hang_axis.negate()
+			hang_axis.normalize()
+			sag = max(0.0, shoulder.z - point.z)
+			lift = max(0.0, point.z - shoulder.z)
+			side = (point - shoulder).dot(side_axis)
+			seated_point = center + side_axis * side + hang_axis * (lift * 0.25 - min(sag, 0.28))
+			if (seated_point - point).length <= 0.55:
+				mesh.data.vertices[index].co = inverse @ seated_point
+				seated += 1
+			elbow_t = 0.45
+			if elbow is not None and abs(span) > 1e-4:
+				elbow_t = max(0.15, min(0.85, (elbow.x - shoulder.x) / span))
+			bone_name = (
+				"dsk_upperarm_%s" % side_name if t < elbow_t else "sk_forearm_%s" % side_name
+			)
+			limb = 0.4 + 0.4 * min(1.0, t / 0.35)
+			anchor = "sk_chest" if point.z >= (hip.z + chest.z) * 0.5 else "dsk_hip"
+			weights[index] = {bone_name: limb, anchor: 1.0 - limb}
+			painted += 1
+			arm_roots.append(index)
+			continue
+		if kind == "leg" and dist < 0.32:
+			share = 0.7 * (1.0 - max(0.0, dist - 0.04) / 0.28)
+			share = max(0.0, min(0.7, share))
+			if share < 0.08:
+				continue
+			weights[index] = {bone_name: share, "dsk_hip": 1.0 - share}
+			painted += 1
+	# The hem of a cape is the same sheet as the part on the arm. A vert
+	# near the hip can still belong to that sheet. Walk the faces.
+	if arm_roots:
+		neighbors = {}
+		for poly in mesh.data.polygons:
+			verts = poly.vertices
+			count = len(verts)
+			for cursor in range(count):
+				a = verts[cursor]
+				b = verts[(cursor + 1) % count]
+				neighbors.setdefault(a, set()).add(b)
+				neighbors.setdefault(b, set()).add(a)
+		queue = [(root, 0) for root in arm_roots]
+		seen = set(arm_roots)
+		cursor = 0
+		while cursor < len(queue):
+			current, depth = queue[cursor]
+			cursor += 1
+			if depth >= 18:
+				continue
+			for other in neighbors.get(current, ()):
+				if other in seen or other in tail:
+					continue
+				other_bucket = weights.get(other)
+				if not other_bucket:
+					continue
+				if any(other_bucket.get(name, 0.0) >= 0.45 for name in body_names):
+					continue
+				other_torso = sum(other_bucket.get(name, 0.0) for name in torso_names)
+				if other_torso < 0.4:
+					continue
+				other_point = matrix @ mesh.data.vertices[other].co
+				if _spine_dist(other_point, spine) < 0.12:
+					continue
+				# Below the hip and nearer a leg, this is the skirt, not the cape.
+				if other_point.z < hip.z:
+					arm_dist = None
+					leg_dist = None
+					for start, end, _bone_name, kind in segments:
+						gap = _seg_dist(other_point, start, end)
+						if kind == "arm" and (arm_dist is None or gap < arm_dist):
+							arm_dist = gap
+						if kind == "leg" and (leg_dist is None or gap < leg_dist):
+							leg_dist = gap
+					if leg_dist is not None and arm_dist is not None and leg_dist + 0.05 < arm_dist:
+						continue
+				seen.add(other)
+				queue.append((other, depth + 1))
+				side_name = "l" if other_point.x >= 0.0 else "r"
+				shoulder = _bone_world(pes_arm, "dsk_upperarm_%s" % side_name)
+				elbow = _bone_world(pes_arm, "sk_forearm_%s" % side_name)
+				hand = _bone_world(pes_arm, "sk_hand_%s" % side_name)
+				if shoulder is None or hand is None:
+					continue
+				span = hand.x - shoulder.x
+				t = 0.0 if abs(span) < 1e-4 else (other_point.x - shoulder.x) / span
+				t = max(0.0, min(1.0, t))
+				center = shoulder + (hand - shoulder) * t
+				arm_dir = hand - shoulder
+				if arm_dir.length < 1e-4:
+					continue
+				arm_dir.normalize()
+				side_axis = arm_dir.cross(Vector((0.0, 0.0, 1.0)))
+				if side_axis.length < 1e-4:
+					side_axis = Vector((0.0, 1.0, 0.0))
+				side_axis.normalize()
+				hang_axis = side_axis.cross(arm_dir)
+				if hang_axis.z < 0.0:
+					hang_axis.negate()
+				hang_axis.normalize()
+				sag = max(0.0, shoulder.z - other_point.z)
+				lift = max(0.0, other_point.z - shoulder.z)
+				side = (other_point - shoulder).dot(side_axis)
+				seated_point = center + side_axis * side + hang_axis * (lift * 0.25 - min(sag, 0.28))
+				if (seated_point - other_point).length <= 0.55:
+					mesh.data.vertices[other].co = inverse @ seated_point
+					seated += 1
+				elbow_t = 0.45
+				if elbow is not None and abs(span) > 1e-4:
+					elbow_t = max(0.15, min(0.85, (elbow.x - shoulder.x) / span))
+				bone_name = (
+					"dsk_upperarm_%s" % side_name if t < elbow_t else "sk_forearm_%s" % side_name
+				)
+				# Still mostly the arm. The hip share grows as we walk
+				# off the seeded part, and it never takes the whole vert.
+				limb = max(0.55, 0.8 - depth * 0.03)
+				anchor = "dsk_hip" if other_point.z < chest.z else "sk_chest"
+				weights[other] = {bone_name: limb, anchor: 1.0 - limb}
+				painted += 1
+	mesh.data.update()
+	count = _write_groups(mesh, weights)
+	return {"mesh": mesh.name, "armature": pes_arm.name, "painted": painted, "seated": seated, "groups": count}

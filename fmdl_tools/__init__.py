@@ -14,7 +14,7 @@ import bpy
 
 from .atlas import build_body_atlas
 from .merge import merge_gloves, selection_summary
-from .retarget import retarget_to_pes, transfer_boneless_to_pes
+from .retarget import drape_cloth, retarget_to_pes, transfer_boneless_to_pes
 
 
 class FMDLTOOLS_AddonPreferences(bpy.types.AddonPreferences):
@@ -147,6 +147,35 @@ class FMDLTOOLS_OT_boneless_pes(bpy.types.Operator):
 		return {"FINISHED"}
 
 
+class FMDLTOOLS_OT_drape_cloth(bpy.types.Operator):
+	bl_idname = "fmdltools.drape_cloth"
+	bl_label = "Drape cloth onto limbs"
+	bl_description = (
+		"Share a coat or skirt between the torso and the arm or leg it lies on. "
+		"Run this after Convert, on the converted body. "
+		"The chest or the hip keeps a share so the cloth does not move as one rigid limb"
+	)
+	bl_options = {"REGISTER", "UNDO"}
+
+	@classmethod
+	def poll(cls, context):
+		return bool(context.selected_objects)
+
+	def execute(self, context):
+		try:
+			result = drape_cloth(context)
+		except (ValueError, RuntimeError) as error:
+			self.report({"ERROR"}, str(error))
+			return {"CANCELLED"}
+		self.report(
+			{"INFO"},
+			"Draped %d cloth verts on %s (%d seated on an arm)." % (
+				result["painted"], result["mesh"], result["seated"],
+			),
+		)
+		return {"FINISHED"}
+
+
 class FMDLTOOLS_OT_atlas(bpy.types.Operator):
 	bl_idname = "fmdltools.build_atlas"
 	bl_label = "Build body texture atlas"
@@ -203,6 +232,7 @@ class FMDLTOOLS_PT_main(bpy.types.Panel):
 		layout.prop(prefs, "medic_fmdl", text="Medic FMDL")
 		layout.operator("fmdltools.retarget_pes", text="Convert existing Skeleton to PES Skeleton")
 		layout.operator("fmdltools.boneless_pes", text="Convert \U0001F171oneless Model to PES Skeleton")
+		layout.operator("fmdltools.drape_cloth", text="Drape cloth onto limbs")
 		layout.separator()
 		layout.operator("fmdltools.build_atlas", text="Build body texture atlas")
 
@@ -212,6 +242,7 @@ CLASSES = (
 	FMDLTOOLS_OT_merge_gloves,
 	FMDLTOOLS_OT_retarget_pes,
 	FMDLTOOLS_OT_boneless_pes,
+	FMDLTOOLS_OT_drape_cloth,
 	FMDLTOOLS_OT_atlas,
 	FMDLTOOLS_PT_main,
 )
