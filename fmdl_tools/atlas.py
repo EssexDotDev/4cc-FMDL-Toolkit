@@ -1,13 +1,8 @@
 """Pack a model's color textures into one 2048 body.dds and move the UVs with them.
 
-Each material keeps its own texture in normal 0-1 UV space. The manual
-Kearsarge atlas did the same thing in Photoshop: scale a whole texture into
-a rectangle, then scale that material's UVs into the same rectangle. This
-does that for every color texture on the selected meshes. Toon and sphere
-maps are not color, so they stay out of the sheet.
-
-It does not reproduce a hand-arranged sheet. Five full 2048 textures cannot
-all keep the 1024-pixel slots the Kearsarge body and cloth were given.
+Cell size follows the number of color textures. One texture fills the sheet.
+Two to four textures get 1024. More than that keeps 1024 for the body, the
+face, and the clothes, and puts hair and the rest in smaller power-of-two cells.
 """
 
 import array
@@ -18,7 +13,7 @@ import subprocess
 import bpy
 
 ATLAS = 2048
-GAP = 8
+_RANK = {"body": 0, "cloth": 1, "face": 2, "other": 3, "hair": 4, "accessory": 5}
 _NVTT = os.path.join(
 	os.environ.get("ProgramFiles", r"C:\Program Files"),
 	"NVIDIA Corporation",
@@ -99,48 +94,99 @@ def _union_bounds(boxes):
 	return (minx, miny, maxx, maxy)
 
 
-def _shelf(items, scale):
-	"""Place (name, width, height) at this scale. None when a row falls off."""
-	x = 0
-	y = 0
-	row_h = 0
-	placed = []
-	ordered = sorted(items, key=lambda item: max(item[1], item[2]), reverse=True)
-	for name, width, height in ordered:
-		pw = max(1, int(round(width * scale)))
-		ph = max(1, int(round(height * scale)))
-		if pw > ATLAS or ph > ATLAS:
-			return None
-		if x > 0 and x + pw > ATLAS:
-			x = 0
-			y += row_h + GAP
-			row_h = 0
-		if y + ph > ATLAS:
-			return None
-		placed.append((name, x, y, pw, ph))
-		x += pw + GAP
-		row_h = max(row_h, ph)
-	return placed
+def _role(name):
+	"""Who gets a 1024 cell. Hair stays small. A bikini loses to the body."""
+	text = name.lower()
+	if "hair" in text or "髪" in text:
+		return "hair"
+	if any(word in text for word in ("bra", "bikini", "panty", "panties", "underwear", "thong")):
+		return "accessory"
+	if "face" in text or "顔" in text:
+		return "face"
+	if any(word in text for word in ("body", "skin", "体", "肌")):
+		return "body"
+	if any(word in text for word in ("cloth", "suit", "outfit", "wear", "dress", "uniform", "shirt", "skirt", "sock", "glove", "boot")):
+		return "cloth"
+	return "other"
 
 
-def pack_slots(items):
-	"""Uniform scale, then a shelf pack. items are (name, pixel width, pixel height)."""
-	if not items:
-		return None, 1.0
-	best = None
-	best_scale = 0.0
-	low = 0.02
-	high = 1.0
-	for _ in range(20):
-		scale = (low + high) * 0.5
-		placed = _shelf(items, scale)
-		if placed is None:
-			high = scale
-		else:
-			best = placed
-			best_scale = scale
-			low = scale
-	return best, best_scale
+def _cell_sizes(entries):
+	"""Power-of-two side length for each entry, already in priority order.
+
+	One texture fills the sheet. Up to four textures get 1024 each. Past that,
+	the body, the face, and the clothes are grown first and hair stays smaller.
+	"""
+	count = len(entries)
+	if count == 1:
+		return [ATLAS]
+	if count <= 4:
+		return [1024] * count
+	if count <= 16:
+		base = 512
+	elif count <= 64:
+		base = 256
+	else:
+		base = 128
+	sizes = [base] * count
+	limit = ATLAS * ATLAS
+	changed = True
+	while changed:
+		changed = False
+		for index, side in enumerate(sizes):
+			if side >= 1024:
+				continue
+			grown = side * 2
+			used = sum(item * item for item in sizes) - side * side + grown * grown
+			if used <= limit:
+				sizes[index] = grown
+				changed = True
+				break
+	return sizes
+
+
+def _place(named_sizes):
+	"""Pack power-of-two squares. Returns rectangles and any name that did not fit."""
+	if not named_sizes:
+		return {}, []
+	step = min(size for _name, size in named_sizes)
+	cells = ATLAS // step
+	taken = [[False] * cells for _ in range(cells)]
+	rects = {}
+	dropped = []
+	order = sorted(named_sizes, key=lambda item: -item[1])
+	for name, size in order:
+		span = size // step
+		found = None
+		for gy in range(cells - span, -1, -1):
+			for gx in range(cells - span + 1):
+				if any(taken[gy + dy][gx + dx] for dy in range(span) for dx in range(span)):
+					continue
+				found = (gx, gy)
+				break
+			if found is not None:
+				break
+		if found is None:
+			dropped.append(name)
+			continue
+		gx, gy = found
+		for dy in range(span):
+			for dx in range(span):
+				taken[gy + dy][gx + dx] = True
+		rects[name] = (gx * step, gy * step, size, size)
+	return rects, dropped
+
+
+def assign_slots(named):
+	"""Place each texture in a power-of-two cell. named is (name, used-uv area).
+
+	Returns the placed rectangles and the names that did not fit. Rectangles
+	are (x, y, width, height) with y measured from the bottom.
+	"""
+	entries = [{"name": name, "role": _role(name), "area": area} for name, area in named]
+	entries.sort(key=lambda entry: (_RANK[entry["role"]], -entry["area"]))
+	sizes = _cell_sizes(entries)
+	rects, dropped = _place([(entry["name"], size) for entry, size in zip(entries, sizes)])
+	return rects, dropped
 
 
 def _pixels(image):
@@ -204,39 +250,6 @@ def _blit(dest, src, px, py, pw, ph):
 		src_i = row * pw * 4
 		dest_i = ((py + row) * ATLAS + px) * 4
 		dest[dest_i:dest_i + width * 4] = src[src_i:src_i + width * 4]
-
-
-def _bleed(dest, px, py, pw, ph, pad):
-	"""Repeat the slot edge into the gap so the mip chain does not pick up the grey."""
-	for n in range(1, pad + 1):
-		for row in range(ph):
-			y = py + row
-			if y < 0 or y >= ATLAS:
-				continue
-			left = px - n
-			right = px + pw - 1 + n
-			src_left = (y * ATLAS + px) * 4
-			src_right = (y * ATLAS + px + pw - 1) * 4
-			if left >= 0:
-				dest_i = (y * ATLAS + left) * 4
-				dest[dest_i:dest_i + 4] = dest[src_left:src_left + 4]
-			if right < ATLAS:
-				dest_i = (y * ATLAS + right) * 4
-				dest[dest_i:dest_i + 4] = dest[src_right:src_right + 4]
-		for col in range(px - n, px + pw + n):
-			if col < 0 or col >= ATLAS:
-				continue
-			below = py - n
-			above = py + ph - 1 + n
-			sample_y = py if below == py - n else py + ph - 1
-			if below >= 0:
-				src_i = (sample_y * ATLAS + col) * 4
-				dest_i = (below * ATLAS + col) * 4
-				dest[dest_i:dest_i + 4] = dest[src_i:src_i + 4]
-			if above < ATLAS and n:
-				src_i = ((py + ph - 1) * ATLAS + col) * 4
-				dest_i = (above * ATLAS + col) * 4
-				dest[dest_i:dest_i + 4] = dest[src_i:src_i + 4]
 
 
 def _write_image(buf):
@@ -328,36 +341,31 @@ def build_body_atlas(context):
 			users[image.name]["slots"].append((mesh_obj, index))
 	if not users:
 		raise ValueError("None of the selected materials have a color texture.")
-	items = []
-	merged = {}
+	named = []
 	for name, entry in users.items():
-		image = entry["image"]
 		bounds = _union_bounds(entry["bounds"])
-		src_w = max(1, int(image.size[0]))
-		src_h = max(1, int(image.size[1]))
-		crop_w = max(1, int(math.ceil((bounds[2] - bounds[0]) * src_w)))
-		crop_h = max(1, int(math.ceil((bounds[3] - bounds[1]) * src_h)))
-		items.append((name, crop_w, crop_h))
-		merged[name] = bounds
-	placed, scale = pack_slots(items)
-	if not placed:
+		named.append((name, (bounds[2] - bounds[0]) * (bounds[3] - bounds[1])))
+	rects, dropped = assign_slots(named)
+	if not rects:
 		raise ValueError("The textures do not fit in a 2048 atlas.")
-	rects = {name: (px, py, pw, ph) for name, px, py, pw, ph in placed}
+	# The whole source image goes in the cell, the way the Photoshop layers do.
+	full = (0.0, 0.0, 1.0, 1.0)
 	dest = array.array("f", [0.8, 0.8, 0.8, 1.0]) * (ATLAS * ATLAS)
 	report = []
 	for name, entry in users.items():
+		if name not in rects:
+			continue
 		px, py, pw, ph = rects[name]
-		chunk = _crop_scale(entry["image"], merged[name], pw, ph)
+		chunk = _crop_scale(entry["image"], full, pw, ph)
 		_blit(dest, chunk, px, py, pw, ph)
-		_bleed(dest, px, py, pw, ph, GAP // 2)
 		report.append((entry["image"].name, int(entry["image"].size[0]), pw))
 	atlas = _write_image(dest)
-	for entry in users.values():
-		bounds = merged[entry["image"].name]
-		rect = rects[entry["image"].name]
+	for name, entry in users.items():
+		if name not in rects:
+			continue
 		for mesh_obj, index in entry["slots"]:
-			_move_uvs(mesh_obj, index, bounds, rect)
-	_point_materials(meshes, atlas, set(users))
+			_move_uvs(mesh_obj, index, full, rects[name])
+	_point_materials(meshes, atlas, set(rects))
 	directory = bpy.path.abspath("//")
 	if not bpy.data.filepath or not os.path.isdir(directory):
 		directory = os.path.dirname(bpy.path.abspath(users[next(iter(users))]["image"].filepath))
@@ -365,9 +373,9 @@ def build_body_atlas(context):
 		directory = bpy.app.tempdir
 	dds_path, note = _save_dds(atlas, directory)
 	return {
-		"textures": len(users),
+		"textures": len(rects),
 		"missing": missing,
-		"scale": scale,
+		"dropped": dropped,
 		"slots": report,
 		"dds": dds_path,
 		"note": note,

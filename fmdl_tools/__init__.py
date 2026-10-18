@@ -3,7 +3,7 @@
 bl_info = {
 	"name": "FMDL tools",
 	"author": "EssexDotDev",
-	"version": (1, 2, 0),
+	"version": (1, 4, 0),
 	"blender": (5, 2, 0),
 	"location": "View3D > Sidebar > FMDL tools",
 	"description": "Merge gloves onto a body, put a mesh on the PES medic skeleton, and pack a body.dds atlas",
@@ -151,11 +151,9 @@ class FMDLTOOLS_OT_atlas(bpy.types.Operator):
 	bl_idname = "fmdltools.build_atlas"
 	bl_label = "Build body texture atlas"
 	bl_description = (
-		"Pack each material's color texture into one 2048 body.dds and move that material's UVs "
-		"into the same rectangle. This is the Photoshop step from the Kearsarge sheet: one scale "
-		"and move per texture, not a hand-arranged layout. Toon and sphere maps are left alone. "
-		"Run it while the UVs still sit in each texture's own 0-1 space. "
-		"A 2048 texture usually lands around a third of its size, because several of them share one sheet"
+		"Pack the color textures into one 2048 body.dds and move the UVs. "
+		"Fewer textures get larger cells. Body, face, and clothes outrank hair. "
+		"Run it while the UVs still sit in each texture's own 0-1 space"
 	)
 	bl_options = {"REGISTER", "UNDO"}
 
@@ -169,15 +167,18 @@ class FMDLTOOLS_OT_atlas(bpy.types.Operator):
 		except (ValueError, RuntimeError) as error:
 			self.report({"ERROR"}, str(error))
 			return {"CANCELLED"}
-		sizes = ", ".join("%s %d→%d" % (name, src, dst) for name, src, dst in result["slots"][:6])
+		sizes = ", ".join("%s %d" % (name, dst) for name, _src, dst in result["slots"][:6])
 		note = (" " + result["note"]) if result["note"] else ""
 		skipped = ""
 		if result["missing"]:
 			skipped = " Skipped materials with no texture: %s." % ", ".join(result["missing"][:4])
+		left_out = ""
+		if result.get("dropped"):
+			left_out = " Left out %s." % ", ".join(result["dropped"][:4])
 		self.report(
 			{"INFO"},
-			"Packed %d texture(s) at %.0f%% into %s. %s.%s%s" % (
-				result["textures"], result["scale"] * 100.0, result["dds"], sizes, skipped, note,
+			"Packed %d texture(s) into %s. %s.%s%s%s" % (
+				result["textures"], result["dds"], sizes, skipped, left_out, note,
 			),
 		)
 		return {"FINISHED"}
