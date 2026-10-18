@@ -1300,8 +1300,10 @@ def _keep_shoulders(mesh, weights, pes_arm):
 			point = matrix @ mesh.data.vertices[index].co
 			along = (point - chest).dot(direction)
 			# Full clavicle on the chest side of the joint, full arm 6cm past it.
+			# A sleeve hanging off the joint stays on the arm. Only the cap,
+			# close to the joint, blends onto the clavicle.
 			past = along - joint_along
-			if past >= 0.06:
+			if past >= 0.06 or (point - joint).length > 0.06:
 				continue
 			share = 1.0 - (past + 0.06) / 0.12
 			share = max(0.0, min(1.0, share))
@@ -1342,31 +1344,60 @@ def _gap_clusters(items, gap):
 	return list(groups.values())
 
 
-def _box_gap(depth, lateral, box):
-	"""Distance from a point to a depth/side box. Zero when the point is inside."""
-	d0, d1, s0, s1 = box
-	if depth < d0:
-		dd = d0 - depth
-	elif depth > d1:
-		dd = depth - d1
-	else:
-		dd = 0.0
-	if lateral < s0:
-		ds = s0 - lateral
-	elif lateral > s1:
-		ds = lateral - s1
-	else:
-		ds = 0.0
-	return (dd * dd + ds * ds) ** 0.5
+def _appendage_root(mesh, column_ids, forward, side, hip):
+	"""The free column plus the short bridge back to where it joins.
+
+	The join is still the thin sheet behind the hip. The walk stops when
+	the sheet comes forward onto the butt or spreads out to the width of
+	a thigh, so shorts and the leg stay on the leg.
+	"""
+	matrix = mesh.matrix_world
+	laterals = []
+	for index in column_ids:
+		point = matrix @ mesh.data.vertices[index].co
+		laterals.append(point.x * side.x + point.y * side.y)
+	# The root flares wider than the free column. 12cm covers that flare
+	# without reaching the outside of a thigh.
+	lo = min(laterals) - 0.12
+	hi = max(laterals) + 0.12
+	neighbors = {}
+	for edge in mesh.data.edges:
+		a, b = edge.vertices
+		neighbors.setdefault(a, []).append(b)
+		neighbors.setdefault(b, []).append(a)
+	seen = set(column_ids)
+	ring = set(column_ids)
+	for _step in range(12):
+		nxt = []
+		for index in ring:
+			for other in neighbors.get(index, []):
+				if other in seen:
+					continue
+				point = matrix @ mesh.data.vertices[other].co
+				# The join is at the pelvis. Stop before the walk climbs
+				# the back or the hair.
+				if point.z > hip.z + 0.10:
+					continue
+				behind = _depth(hip, forward) - _depth(point, forward)
+				lateral = point.x * side.x + point.y * side.y
+				if behind < 0.07 or lateral < lo or lateral > hi:
+					continue
+				nxt.append(other)
+		if not nxt:
+			break
+		seen.update(nxt)
+		ring = set(nxt)
+	return seen
 
 
 def _hanging_appendage(mesh, pes_arm):
-	"""A tail or a coat leaves the body and hangs down beside it.
+	"""A tail leaves the body and hangs down behind it.
 
-	Slices run from the head to the feet. The torso column is the body.
-	A cluster that opens a gap, then keeps going parallel to that column,
-	is an appendage. Hair does the same thing but it is already there above
-	the neck, so a column that reaches the head is left alone.
+	Slices run from the head to the feet. A cluster that sits wholly
+	behind the hip, and stays a narrow column on the way down, is an
+	appendage. The root of that column is walked back to the join.
+	Hair starts above the chest, so that column is left alone. A coat is
+	wide and is not this sheet: cloth may share the limb it actually lies on.
 	"""
 	forward = _facing_vector(pes_arm)
 	side = Vector((-forward.y, forward.x, 0.0))
@@ -1379,12 +1410,13 @@ def _hanging_appendage(mesh, pes_arm):
 	if len(points) < 30:
 		return set()
 	chest_z = chest.z if chest is not None else hip.z + 0.25
+	hip_depth = _depth(hip, forward)
 
 	def project(point):
 		return _depth(point, forward), point.x * side.x + point.y * side.y
 
-	body = None
 	columns = []
+	finished = []
 	z = max(point.z for _, point in points) + 0.04
 	z_min = min(point.z for _, point in points)
 	while z > z_min:
@@ -1395,6 +1427,10 @@ def _hanging_appendage(mesh, pes_arm):
 			depth, lateral = project(point)
 			claimed = False
 			for column in columns:
+				# Hair stops at the hip. Otherwise its box grows down the
+				# back and the tail is thrown out with the hair.
+				if column["hair"] and point.z < hip.z:
+					continue
 				if (
 					column["d0"] - 0.03 <= depth <= column["d1"] + 0.03
 					and column["s0"] - 0.03 <= lateral <= column["s1"] + 0.03
@@ -1412,33 +1448,30 @@ def _hanging_appendage(mesh, pes_arm):
 					break
 			if not claimed:
 				fresh.append((index, depth, lateral, point.z))
+		still = []
 		for column in columns:
 			if column.pop("seen", False):
 				column["miss"] = 0
+				still.append(column)
 			else:
 				column["miss"] = column.get("miss", 0) + 1
-		columns = [column for column in columns if column.get("miss", 0) <= 3]
+				if column["miss"] <= 3:
+					still.append(column)
+				else:
+					# The column ended above the feet. Keep it.
+					finished.append(column)
+		columns = still
 		if len(fresh) < 8:
 			continue
 		clusters = _gap_clusters(fresh, 0.045)
-		if body is None:
-			body_cluster = max(clusters, key=len)
-			depths = [item[1] for item in body_cluster]
-			sides = [item[2] for item in body_cluster]
-			body = (min(depths), max(depths), min(sides), max(sides))
-			continue
-		body_parts = []
 		for cluster in clusters:
-			nearest = min(_box_gap(item[1], item[2], body) for item in cluster)
-			# Rear is the low end of depth. A tail sits wholly behind the body.
-			# A leg sits beside it at the same depth and must stay on the body.
-			rear = max(item[1] for item in cluster) < body[0] - 0.02
-			if nearest <= 0.02 or not rear or len(cluster) > len(fresh) * 0.45:
-				body_parts.extend(cluster)
+			# Wholly behind the hip bone by 8cm. The legs and the shorts
+			# sit on the hip or in front of it, so they stay the body.
+			# Measuring from the bone, not from a box around the mesh,
+			# keeps a tail from being swallowed once its root touches the butt.
+			if max(item[1] for item in cluster) >= hip_depth - 0.08:
 				continue
-			if len(cluster) < 3 or nearest < 0.025:
-				# Still touching the butt. Do not grow the body box out to it,
-				# or the rest of the tail gets swallowed on the next slice.
+			if len(cluster) < 3 or len(cluster) > len(fresh) * 0.45:
 				continue
 			depths = [item[1] for item in cluster]
 			sides = [item[2] for item in cluster]
@@ -1454,20 +1487,23 @@ def _hanging_appendage(mesh, pes_arm):
 				"hair": max(zs) > chest_z,
 				"miss": 0,
 			})
-		if body_parts:
-			depths = [item[1] for item in body_parts]
-			sides = [item[2] for item in body_parts]
-			body = (min(depths), max(depths), min(sides), max(sides))
+	finished.extend(columns)
 	marked = set()
-	for column in columns:
+	for column in finished:
 		if column["hair"]:
 			continue
-		if column["z1"] > hip.z + 0.02:
+		# A butt bulge stays up at the hip. A tail keeps going down.
+		if column["z1"] > hip.z - 0.15:
 			continue
 		if column["z0"] - column["z1"] < 0.12:
 			continue
+		# A coat spans the back. A tail is a narrow column.
+		if column["s1"] - column["s0"] > 0.24 or len(column["ids"]) < 12:
+			continue
 		marked.update(column["ids"])
-	return marked
+	if not marked:
+		return marked
+	return _appendage_root(mesh, marked, forward, side, hip)
 
 
 def _keep_pelvis(mesh, weights, pes_arm):
@@ -1486,16 +1522,20 @@ def _keep_pelvis(mesh, weights, pes_arm):
 		"sk_hand_l", "sk_hand_r", "dsk_wrist_l", "dsk_wrist_r",
 	)
 	hanging = _hanging_appendage(mesh, pes_arm)
+	hip_bone = _bone_world(pes_arm, "dsk_hip")
 	for index in hanging:
 		bucket = weights.get(index)
 		if bucket and any(bucket.get(name, 0.0) > 0.25 for name in protected):
 			continue
-		# The boot is the leg. A coat hangs outside that column, so a vert
-		# that is already a leg stays a leg.
-		if bucket:
+		# A boot beside the hip is the leg. The tail root hangs behind the
+		# hip, and it stays the hip even when a previous pass painted it thigh.
+		if bucket and hip_bone is not None:
 			limb = sum(bucket.get(key, 0.0) for key in leg_keys)
 			if limb >= 0.5:
-				continue
+				point = matrix @ mesh.data.vertices[index].co
+				behind = _depth(hip_bone, forward) - _depth(point, forward)
+				if behind < 0.07:
+					continue
 		if not bucket:
 			weights[index] = {"dsk_hip": 1.0}
 			continue
@@ -1504,53 +1544,73 @@ def _keep_pelvis(mesh, weights, pes_arm):
 			moved += bucket.pop(key, 0.0)
 		if moved or "dsk_hip" not in bucket:
 			bucket["dsk_hip"] = bucket.get("dsk_hip", 0.0) + moved
-	# The tail is on the hip. Leave it out of the crease, or the centroid
-	# drops down the tail and the thigh takes it back.
-	hip_points = [
-		point for index, point in (
-			(index, matrix @ mesh.data.vertices[index].co)
-			for index, bucket in weights.items()
-			if bucket.get("dsk_hip", 0.0) >= 0.5 and index not in hanging
-		)
-	]
-	if len(hip_points) >= 8:
-		hip = sum(hip_points, Vector()) / len(hip_points)
-	else:
-		hip = _bone_world(pes_arm, "dsk_hip")
-		if hip is None:
-			return
-	hip_depth = _depth(hip, forward)
+	if hip_bone is None:
+		return
+	# The hip bone, not the hip-weighted centroid. A tail in that centroid
+	# pulls the measurement back and the thigh window then covers the tail.
+	hip_depth = _depth(hip_bone, forward)
+	# The medic shirt hem lands on the upper thigh. It is not the butt joint.
+	for side in ("l", "r"):
+		hem = "dsk_hem_%s" % side
+		dest = "sk_thigh_%s" % side
+		for index, bucket in weights.items():
+			if index in hanging:
+				continue
+			amount = bucket.pop(hem, 0.0)
+			if amount:
+				bucket[dest] = bucket.get(dest, 0.0) + amount
+	for side in ("l", "r"):
+		joint = _bone_world(pes_arm, "sk_thigh_%s" % side)
+		if joint is None:
+			continue
+		other = _bone_world(pes_arm, "sk_thigh_r" if side == "l" else "sk_thigh_l")
+		dest = "sk_thigh_%s" % side
+		for index, bucket in weights.items():
+			if index in hanging:
+				continue
+			if any(bucket.get(name, 0.0) > 0.35 for name in protected):
+				continue
+			point = matrix @ mesh.data.vertices[index].co
+			# This leg. The centerline is the tail and the butt crack, and
+			# it is the same distance from both thighs, so it stays on the hip.
+			if abs(point.x - joint.x) > 0.12:
+				continue
+			if other is not None and abs(point.x - joint.x) >= abs(point.x - other.x):
+				continue
+			behind = hip_depth - _depth(point, forward)
+			if behind > 0.07:
+				continue
+			# Full hip 8cm above the joint, full thigh 4cm below it.
+			span = (joint.z + 0.08) - point.z
+			if span <= 0.0 or span >= 0.12:
+				continue
+			total = bucket.get("dsk_hip", 0.0) + bucket.get(dest, 0.0)
+			if total < 0.35:
+				continue
+			share = span / 0.12
+			for key in thigh_keys:
+				if key != dest:
+					total += bucket.pop(key, 0.0)
+			bucket["dsk_hip"] = total * (1.0 - share)
+			bucket[dest] = total * share
+	# The socket behind the hip is where a tail joins. Thigh weight there
+	# pulls the root with the leg. The calf is below this band and stays.
 	for index, bucket in weights.items():
 		if index in hanging:
 			continue
+		if any(bucket.get(name, 0.0) > 0.35 for name in protected):
+			continue
 		point = matrix @ mesh.data.vertices[index].co
-		# Full hip just above the joint, full thigh 12cm below. The source
-		# groups meet in a hard cut, so both sides of that cut get a share.
-		span = (hip.z + 0.04) - point.z
-		if span <= 0.0 or span >= 0.22:
+		if point.z < hip_bone.z - 0.10 or point.z > hip_bone.z + 0.12:
 			continue
 		behind = hip_depth - _depth(point, forward)
-		# The rear of the pelvis, not the tail. The tail is already marked.
-		if behind > 0.14 or behind < -0.02:
+		if behind <= 0.07:
 			continue
-		if abs(point.x) > 0.22:
-			continue
-		thigh_here = sum(bucket.get(key, 0.0) for key in thigh_keys)
-		if thigh_here < 0.2:
-			continue
-		# Only give thigh weight back to the hip. A tail root is already on
-		# the hip, and this pass must not hand it to the leg.
-		share = span / 0.22
-		keep = thigh_here * share
-		moved = thigh_here - keep
-		if moved <= 0.0:
-			continue
+		moved = 0.0
 		for key in thigh_keys:
-			amount = bucket.get(key, 0.0)
-			if amount <= 0.0:
-				continue
-			bucket[key] = amount * share
-		bucket["dsk_hip"] = bucket.get("dsk_hip", 0.0) + moved
+			moved += bucket.pop(key, 0.0)
+		if moved:
+			bucket["dsk_hip"] = bucket.get("dsk_hip", 0.0) + moved
 
 
 def _attach(context, mesh, pes_arm):
@@ -1785,6 +1845,17 @@ def _fit_naked_body(mesh, medic, pes_arm):
 	scale = target["height"] / source["height"]
 	if scale < 0.02 or scale > 50.0:
 		return _fit_identity()
+	# Already standing on the medic's ground, and within a hair's worth of
+	# its height. Kearsarge's chest sits forward of the bone; sliding that
+	# "error" pulls the body off the skeleton. Leave the mesh and copy weights.
+	if abs(source["foot"] - target["foot"]) < 0.04 and 0.88 <= scale <= 1.12:
+		return {
+			"scale": 1.0,
+			"origin": source["center"],
+			"target": source["center"],
+			"resized": False,
+			"hair": source["hair"],
+		}
 	# Hair above the skull makes a fitted body look 10-20% tall. Leave it.
 	applied = scale
 	if abs(scale - 1.0) < 0.03:
@@ -1803,6 +1874,114 @@ def _fit_naked_body(mesh, medic, pes_arm):
 		return {"scale": 1.0, "origin": origin, "target": dest, "resized": False, "hair": source["hair"]}
 	_apply_uniform(mesh, origin, dest, applied)
 	return {"scale": applied, "origin": origin, "target": dest, "resized": applied != 1.0, "hair": source["hair"]}
+
+
+def _bone_segments(pes_arm):
+	"""Limb and spine segments used to tell the body surface from a hanging sheet."""
+	pairs = (
+		("sk_neck", "sk_chest"),
+		("sk_chest", "sk_belly"),
+		("sk_belly", "dsk_hip"),
+		("dsk_upperarm_l", "sk_forearm_l"),
+		("sk_forearm_l", "sk_hand_l"),
+		("dsk_upperarm_r", "sk_forearm_r"),
+		("sk_forearm_r", "sk_hand_r"),
+		("sk_thigh_l", "sk_leg_l"),
+		("sk_leg_l", "sk_foot_l"),
+		("sk_thigh_r", "sk_leg_r"),
+		("sk_leg_r", "sk_foot_r"),
+	)
+	segments = []
+	for start_name, end_name in pairs:
+		start = _bone_world(pes_arm, start_name)
+		end = _bone_world(pes_arm, end_name)
+		if start is not None and end is not None:
+			segments.append((start, end))
+	return segments
+
+
+def _axis_radius(point, neck):
+	return ((point.x - neck.x) ** 2 + (point.y - neck.y) ** 2) ** 0.5
+
+
+def _hair_from_scalp(mesh, pes_arm):
+	"""Hair is the sheet hung from the scalp, not the jacket wrapped on the body.
+
+	The sheet only meets the body at the neck. Seeds are the scalp and the
+	mass hanging behind the torso. The walk stops at the neck column, so a
+	tight jacket that wraps the chest stays on the chest and the arms.
+	"""
+	neck = _bone_world(pes_arm, "sk_neck")
+	chest = _bone_world(pes_arm, "sk_chest")
+	if neck is None or chest is None:
+		return []
+	matrix = mesh.matrix_world
+	points = [matrix @ vertex.co for vertex in mesh.data.vertices]
+	weld = set()
+	seeds = []
+	for index, point in enumerate(points):
+		radius = _axis_radius(point, neck)
+		if radius < 0.11 and chest.z < point.z < neck.z + 0.04:
+			weld.add(index)
+			continue
+		if point.z > neck.z + 0.08 or (0.4 <= point.z <= chest.z + 0.05 and point.y > neck.y + 0.12):
+			seeds.append(index)
+	neighbors = {}
+	for poly in mesh.data.polygons:
+		verts = poly.vertices
+		count = len(verts)
+		for cursor in range(count):
+			a = verts[cursor]
+			b = verts[(cursor + 1) % count]
+			neighbors.setdefault(a, set()).add(b)
+			neighbors.setdefault(b, set()).add(a)
+	seen = set()
+	stack = list(seeds)
+	while stack:
+		index = stack.pop()
+		if index in seen or index in weld:
+			continue
+		seen.add(index)
+		stack.extend(neighbors.get(index, ()))
+	return list(seen)
+
+
+def _neck_column(mesh, pes_arm):
+	"""The neck is a narrow column under the head, not the chest or the hair."""
+	neck = _bone_world(pes_arm, "sk_neck")
+	chest = _bone_world(pes_arm, "sk_chest")
+	if neck is None or chest is None:
+		return []
+	matrix = mesh.matrix_world
+	found = []
+	for vertex in mesh.data.vertices:
+		point = matrix @ vertex.co
+		# Only the column at the neck joint. The chest below it stays chest.
+		if point.z < neck.z - 0.08 or point.z > neck.z + 0.05:
+			continue
+		if _axis_radius(point, neck) < 0.055:
+			found.append(vertex.index)
+	return found
+
+
+def _neck_is_a_column(mesh, weights, pes_arm):
+	"""Neck weight below the column belongs on the chest.
+
+	The medic neck is a stump, so a high collar copies sk_neck onto the chest.
+	"""
+	neck = _bone_world(pes_arm, "sk_neck")
+	if neck is None:
+		return
+	matrix = mesh.matrix_world
+	for index, bucket in weights.items():
+		amount = bucket.get("sk_neck", 0.0)
+		if amount < 0.05:
+			continue
+		point = matrix @ mesh.data.vertices[index].co
+		if point.z >= neck.z - 0.07 and _axis_radius(point, neck) < 0.06:
+			continue
+		bucket.pop("sk_neck", None)
+		bucket["sk_chest"] = bucket.get("sk_chest", 0.0) + amount
 
 
 def _rear_hair_indices(mesh, pes_arm):
@@ -2023,11 +2202,17 @@ def transfer_boneless_to_pes(context, medic_path, clean=True):
 	_strip_armature_modifiers(mesh)
 	medic = _medic_mesh(context, pes_arm, mesh)
 	if medic is None:
+		imported = import_medic(context, medic_path)
+		medic = _medic_mesh(context, imported, mesh)
+		if medic is not None:
+			pes_arm = imported
+	if medic is None:
 		raise ValueError(
 			"The medic body mesh is not in the scene. Set the medic FMDL so its weights can be copied."
 		)
 	if len(medic.vertex_groups) == 0:
 		raise ValueError("The medic body has no vertex groups to copy.")
+	source_name = medic.name
 	bbox_fit = _fit_naked_body(mesh, medic, pes_arm)
 	weights = _transfer_weights(context, mesh, medic)
 	if not weights:
@@ -2040,21 +2225,36 @@ def transfer_boneless_to_pes(context, medic_path, clean=True):
 		weight_fit = _fit_to_medic(context, mesh, pes_arm, weights)
 	arm_weights = _arm_weights_for_scale(mesh, weights)
 	arm_scales = _scale_arms(context, mesh, pes_arm, arm_weights, {}, _fit_identity())
-	weights = _transfer_weights(context, mesh, medic)
-	if not weights:
-		raise ValueError("Weight transfer produced no vertex groups after the mesh was fitted.")
-	for index in _rear_hair_indices(mesh, pes_arm):
+	# The weights were copied while the mesh still sat on the medic. A second
+	# copy after the arms move paints the face and the hair onto the limbs.
+	weights = arm_weights
+	hair = set(_hair_from_scalp(mesh, pes_arm))
+	for index in hair:
 		weights[index] = {"sk_head": 1.0}
+	for index in _neck_column(mesh, pes_arm):
+		weights[index] = {"sk_neck": 1.0}
+	_neck_is_a_column(mesh, weights, pes_arm)
+	for index, bucket in list(weights.items()):
+		if index in hair:
+			continue
+		moved = 0.0
+		for key in ("dsk_forearm_l", "dsk_forearm_r", "dsk_forearm_t_l", "dsk_forearm_t_r"):
+			moved = bucket.pop(key, 0.0)
+			if moved:
+				side = "l" if key.endswith("l") else "r"
+				bucket["sk_forearm_%s" % side] = bucket.get("sk_forearm_%s" % side, 0.0) + moved
 	needed = {name for bucket in weights.values() for name in bucket}
 	_add_missing_bones(context, pes_arm, needed)
 	count = _write_groups(mesh, weights)
 	_attach(context, mesh, pes_arm)
+	mesh_name = mesh.name
+	arm_name = pes_arm.name
 	if clean:
 		_cleanup_import(context, mesh, pes_arm)
 	return {
-		"mesh": mesh.name,
-		"armature": pes_arm.name,
-		"source": medic.name,
+		"mesh": mesh_name,
+		"armature": arm_name,
+		"source": source_name,
 		"groups": count,
 		"scale": bbox_fit["scale"] * weight_fit["scale"],
 		"arms": arm_scales,
@@ -2081,12 +2281,14 @@ def retarget_to_pes(context, medic_path, clean=True):
 	_add_missing_bones(context, pes_arm, needed)
 	count = _write_groups(mesh, weights)
 	_attach(context, mesh, pes_arm)
+	mesh_name = mesh.name
+	arm_name = pes_arm.name
 	if clean:
 		_cleanup_import(context, mesh, pes_arm)
 	mapped = len([name for name, target in named.items() if target]) + len(spatial)
 	return {
-		"mesh": mesh.name,
-		"armature": pes_arm.name,
+		"mesh": mesh_name,
+		"armature": arm_name,
 		"groups": count,
 		"mapped": mapped,
 		"skipped": len(skipped),
