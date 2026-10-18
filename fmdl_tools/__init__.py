@@ -26,6 +26,11 @@ class FMDLTOOLS_AddonPreferences(bpy.types.AddonPreferences):
 		subtype="FILE_PATH",
 		default="",
 	)
+	clean_scene: bpy.props.BoolProperty(
+		name="Clean the scene",
+		description="Delete everything outside the medic FMDL. Off leaves other objects in the file",
+		default=True,
+	)
 
 
 class FMDLTOOLS_OT_merge_gloves(bpy.types.Operator):
@@ -76,7 +81,7 @@ class FMDLTOOLS_OT_retarget_pes(bpy.types.Operator):
 	def execute(self, context):
 		prefs = context.preferences.addons[__package__].preferences
 		try:
-			result = retarget_to_pes(context, prefs.medic_fmdl)
+			result = retarget_to_pes(context, prefs.medic_fmdl, prefs.clean_scene)
 		except (ValueError, RuntimeError) as error:
 			self.report({"ERROR"}, str(error))
 			return {"CANCELLED"}
@@ -123,7 +128,7 @@ class FMDLTOOLS_OT_boneless_pes(bpy.types.Operator):
 	def execute(self, context):
 		prefs = context.preferences.addons[__package__].preferences
 		try:
-			result = transfer_boneless_to_pes(context, prefs.medic_fmdl)
+			result = transfer_boneless_to_pes(context, prefs.medic_fmdl, prefs.clean_scene)
 		except (ValueError, RuntimeError) as error:
 			self.report({"ERROR"}, str(error))
 			return {"CANCELLED"}
@@ -230,6 +235,7 @@ class FMDLTOOLS_PT_main(bpy.types.Panel):
 		layout.label(text="Select the model")
 		prefs = context.preferences.addons[__package__].preferences
 		layout.prop(prefs, "medic_fmdl", text="Medic FMDL")
+		layout.prop(prefs, "clean_scene", text="Clean the scene")
 		layout.operator("fmdltools.retarget_pes", text="Convert existing Skeleton to PES Skeleton")
 		layout.operator("fmdltools.boneless_pes", text="Convert \U0001F171oneless Model to PES Skeleton")
 		layout.operator("fmdltools.drape_cloth", text="Drape cloth onto limbs")

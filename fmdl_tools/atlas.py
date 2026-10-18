@@ -278,6 +278,38 @@ def _move_uvs(mesh_obj, material_index, bounds, rect):
 			uv.y = oy + uv.y * sy
 
 
+def _body_material(mesh_obj, image):
+	"""One material named body: body.dds into Base Color, alpha 1, out to Surface."""
+	material = bpy.data.materials.get("body")
+	if material is None:
+		material = bpy.data.materials.new("body")
+	material.use_nodes = True
+	nodes = material.node_tree.nodes
+	links = material.node_tree.links
+	nodes.clear()
+	output = nodes.new("ShaderNodeOutputMaterial")
+	shader = nodes.new("ShaderNodeBsdfPrincipled")
+	texture = nodes.new("ShaderNodeTexImage")
+	texture.image = image
+	shader.inputs["Alpha"].default_value = 1.0
+	texture.location = (-400, 300)
+	shader.location = (0, 300)
+	output.location = (300, 300)
+	links.new(texture.outputs["Color"], shader.inputs["Base Color"])
+	links.new(shader.outputs["BSDF"], output.inputs["Surface"])
+	mesh_obj.data.materials.clear()
+	mesh_obj.data.materials.append(material)
+
+
+def _load_body_dds(dds_path, fallback):
+	if dds_path and os.path.isfile(dds_path):
+		image = bpy.data.images.load(dds_path, check_existing=True)
+		image.name = "body.dds"
+		return image
+	fallback.name = "body.dds"
+	return fallback
+
+
 def _point_materials(meshes, atlas_image, packed_names):
 	seen = set()
 	for mesh_obj in meshes:
@@ -372,6 +404,9 @@ def build_body_atlas(context):
 	if not directory or not os.path.isdir(directory):
 		directory = bpy.app.tempdir
 	dds_path, note = _save_dds(atlas, directory)
+	body_image = _load_body_dds(dds_path, atlas)
+	for mesh_obj in meshes:
+		_body_material(mesh_obj, body_image)
 	return {
 		"textures": len(rects),
 		"missing": missing,

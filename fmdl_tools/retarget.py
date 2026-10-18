@@ -238,6 +238,10 @@ def map_group_name(name, available):
 		or _token_prefix(lower_core, "mouth")
 		or _token_prefix(lower_core, "lip")
 		or _token_prefix(lower_core, "chin")
+		or _token_prefix(lower_core, "nose")
+		or _token_prefix(lower_core, "cheek")
+		or _token_prefix(lower_core, "tooth")
+		or _token_prefix(lower_core, "face")
 		or "hat" in lower_core
 		or ("ribbon" in lower_core and "leg" not in lower_core)
 		or lower_core.startswith("m_line")
@@ -283,7 +287,12 @@ def map_group_name(name, available):
 
 
 def _has_finger(core, lower_core):
-	"""Finger words inside the group name. 'ring' in 'earring' is not a finger."""
+	"""Finger words inside the group name. 'ring' in 'earring' is not a finger.
+
+	Eye_middle and Mouth_middle are the face, not a finger named middle.
+	"""
+	if any(token in lower_core for token in ("eye", "mouth", "lip", "brow", "nose", "cheek", "tooth", "face", "eyelash", "mayu")):
+		return False
 	text = lower_core.replace("earring", " ")
 	for word in _FINGERS:
 		if word.isascii():
@@ -1562,6 +1571,37 @@ def _attach(context, mesh, pes_arm):
 		mesh.matrix_world = matrix
 
 
+def _family(root):
+	"""An object and every child under it."""
+	kept = set()
+	stack = [root]
+	while stack:
+		obj = stack.pop()
+		if obj in kept or obj is None:
+			continue
+		kept.add(obj)
+		stack.extend(list(obj.children))
+	return kept
+
+
+def _cleanup_import(context, mesh, pes_arm):
+	"""Keep only the medic FMDL tree. Drop the template body and every leftover."""
+	root = pes_arm
+	while root.parent is not None:
+		root = root.parent
+	kept = _family(root)
+	kept.add(mesh)
+	for obj in list(bpy.data.objects):
+		if obj not in kept:
+			bpy.data.objects.remove(obj, do_unlink=True)
+	for obj in list(bpy.data.objects):
+		if obj.type == "MESH" and obj != mesh and _driven_by(obj, pes_arm):
+			bpy.data.objects.remove(obj, do_unlink=True)
+	for collection in list(bpy.data.collections):
+		if len(collection.objects) == 0 and len(collection.children) == 0:
+			bpy.data.collections.remove(collection)
+
+
 def _facing_vector(pes_arm):
 	"""Horizontal direction the medic faces. Hair behind the head is the opposite way."""
 	head = _bone_world(pes_arm, "sk_head")
@@ -1960,7 +2000,7 @@ def _strip_armature_modifiers(mesh):
 			mesh.modifiers.remove(modifier)
 
 
-def transfer_boneless_to_pes(context, medic_path):
+def transfer_boneless_to_pes(context, medic_path, clean=True):
 	"""Rig a mesh that has no vertex groups by copying the medic body's weights.
 
 	Rear hair is kept out of the line-up. A body already near the medic's
@@ -2009,6 +2049,8 @@ def transfer_boneless_to_pes(context, medic_path):
 	_add_missing_bones(context, pes_arm, needed)
 	count = _write_groups(mesh, weights)
 	_attach(context, mesh, pes_arm)
+	if clean:
+		_cleanup_import(context, mesh, pes_arm)
 	return {
 		"mesh": mesh.name,
 		"armature": pes_arm.name,
@@ -2019,7 +2061,7 @@ def transfer_boneless_to_pes(context, medic_path):
 	}
 
 
-def retarget_to_pes(context, medic_path):
+def retarget_to_pes(context, medic_path, clean=True):
 	if context.object is not None and context.object.mode != "OBJECT":
 		bpy.ops.object.mode_set(mode="OBJECT")
 	pes_arm = find_pes_armature(context)
@@ -2039,6 +2081,8 @@ def retarget_to_pes(context, medic_path):
 	_add_missing_bones(context, pes_arm, needed)
 	count = _write_groups(mesh, weights)
 	_attach(context, mesh, pes_arm)
+	if clean:
+		_cleanup_import(context, mesh, pes_arm)
 	mapped = len([name for name, target in named.items() if target]) + len(spatial)
 	return {
 		"mesh": mesh.name,
