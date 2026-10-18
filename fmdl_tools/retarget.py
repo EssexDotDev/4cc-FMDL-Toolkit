@@ -610,8 +610,8 @@ def _source_bone(mesh, names, side):
 def _assign_cloth(mesh, weights, unknown, named, spatial):
 	"""Hang coats and skirts on the torso. Split sleeves at the elbow.
 
-	Returns how many verts belong to a skirt, cloak, or coat. A real garment
-	is left in its built pose instead of being swung onto the medic arms.
+	Returns how many verts belong to a skirt, cloak, or coat. Those stay on
+	the torso. The sleeves still aim at the arm bones.
 	"""
 	kinds = {}
 	for group in unknown:
@@ -1066,19 +1066,16 @@ def _end_point(mesh, weights, roles, anchor, which):
 	return _mean_point(sample)
 
 
-def _scale_arms(context, mesh, pes_arm, weights, named, fit, warp=True):
+def _scale_arms(context, mesh, pes_arm, weights, named, fit):
 	"""Lengthen each limb from the joint it already has.
 
 	Moving the shoulder or the hip onto the medic bone scrunches a narrow
 	shoulder and drops the pelvis, which bends the spine. The root stays.
-	The hand and the foot scale toward the medic joint.
+	The hand and the foot scale toward the medic joint. A coat on the hip
+	or the chest is not a limb, so it stays where it was built.
 	"""
 	_keep_pelvis(mesh, weights, pes_arm)
 	_keep_shoulders(mesh, weights, pes_arm)
-	# A coat or a dress stays in the pose it was built in. Swinging the
-	# sleeves down onto the medic arm pulls them out of the garment.
-	if not warp:
-		return {}
 	armatures = _source_armatures(context, pes_arm)
 	body = _mean_point(_weight_points(
 		mesh, weights, ("dsk_hip", "sk_belly", "sk_chest", "sk_neck"), 0.5,
@@ -1176,6 +1173,11 @@ def _scale_arms(context, mesh, pes_arm, weights, named, fit, warp=True):
 				best = (proximal, axis, reach, length_scale, rotation)
 				best_key = key
 		if best is None or best_weight < 0.25:
+			continue
+		# The skirt and the cloak hang on the torso. They do not swing
+		# with the arm even when a little sleeve weight leaked onto them.
+		torso = sum(bucket.get(name, 0.0) for name in ("dsk_hip", "sk_belly", "sk_chest", "sk_neck"))
+		if torso >= best_weight and torso >= 0.35:
 			continue
 		proximal, axis, reach, length_scale, rotation = best
 		delta = world - proximal
@@ -2028,13 +2030,11 @@ def retarget_to_pes(context, medic_path):
 		raise ValueError("Select the imported model. The medic mesh is left as the skeleton reference.")
 	mesh = _join(context, meshes)
 	_apply_source_armatures(context, mesh, pes_arm)
-	weights, named, spatial, skipped, unmapped, garment = _accumulate(mesh, pes_arm)
+	weights, named, spatial, skipped, unmapped, _garment = _accumulate(mesh, pes_arm)
 	if not weights:
 		raise ValueError("None of the vertex groups matched a PES bone.")
 	fit = _fit_to_medic(context, mesh, pes_arm, weights)
-	arm_scales = _scale_arms(
-		context, mesh, pes_arm, weights, named, fit, warp=garment < 300,
-	)
+	arm_scales = _scale_arms(context, mesh, pes_arm, weights, named, fit)
 	needed = {name for bucket in weights.values() for name in bucket}
 	_add_missing_bones(context, pes_arm, needed)
 	count = _write_groups(mesh, weights)
