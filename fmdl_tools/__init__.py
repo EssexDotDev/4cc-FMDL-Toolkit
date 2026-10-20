@@ -3,7 +3,7 @@
 bl_info = {
 	"name": "FMDL tools",
 	"author": "EssexDotDev",
-	"version": (1, 4, 0),
+	"version": (1, 5, 0),
 	"blender": (5, 2, 0),
 	"location": "View3D > Sidebar > FMDL tools",
 	"description": "Merge gloves onto a body, put a mesh on the PES medic skeleton, and pack a body.dds atlas",
@@ -93,6 +93,8 @@ class FMDLTOOLS_OT_retarget_pes(bpy.types.Operator):
 			extra = " Height scale %.3f.%s" % (scale, extra)
 		if result.get("arms"):
 			extra = " Wrists moved onto the medic hands.%s" % extra
+		if result.get("rig"):
+			extra = " Rig: %s.%s" % ("; ".join(result["rig"]), extra)
 		self.report(
 			{"INFO"},
 			"Converted %s onto %s (%d PES groups, %d source groups).%s" % (

@@ -12,7 +12,7 @@ import sys
 from collections import defaultdict
 
 import bpy
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 _PESFMDL_DIR = os.path.join(
 	os.environ.get("APPDATA", ""),
@@ -274,10 +274,13 @@ def map_group_name(name, available):
 	if compact == "wrist" and style == "dot":
 		return _place("sk_hand", side, available)
 	if "twist" in compact or "roll" in compact:
-		if "shoulder" in compact or "upper" in compact or compact.startswith("arm"):
+		if "shoulder" in compact or "upper" in compact:
 			return _place("dsk_upperarm", side, available)
-		if "fore" in compact or "lower" in compact or "elbow" in compact:
+		# ArmRoll is the forearm twist. Upper-arm twist is 腕捩 or an "upper" name.
+		if compact.startswith("armroll") or "fore" in compact or "lower" in compact or "elbow" in compact:
 			return _place("sk_forearm", side, available)
+		if compact.startswith("arm"):
+			return _place("dsk_upperarm", side, available)
 		if "wrist" in compact or "hand" in compact:
 			return _place("dsk_wrist", side, available)
 	role = _EN.get(compact)
@@ -466,6 +469,551 @@ def _join(context, meshes):
 	context.view_layer.objects.active = meshes[0]
 	bpy.ops.object.join()
 	return context.view_layer.objects.active
+
+
+# The next joint in the medic chain. A rigged model is posed along these
+# before the mesh is baked. The icosphere on each joint is only the bone's
+# display shape. The pivot is the bone head.
+_POSE_NEXT = {
+	"sk_thigh_l": "sk_leg_l",
+	"sk_thigh_r": "sk_leg_r",
+	"sk_leg_l": "sk_foot_l",
+	"sk_leg_r": "sk_foot_r",
+	"dsk_clavicle_l": "dsk_upperarm_l",
+	"dsk_clavicle_r": "dsk_upperarm_r",
+	"dsk_upperarm_l": "sk_forearm_l",
+	"dsk_upperarm_r": "sk_forearm_r",
+	"sk_upperarm_l": "sk_forearm_l",
+	"sk_upperarm_r": "sk_forearm_r",
+	"sk_forearm_l": "sk_hand_l",
+	"sk_forearm_r": "sk_hand_r",
+}
+
+
+def _driven_meshes(source, pes_arm):
+	found = []
+	for obj in bpy.data.objects:
+		if obj.type != "MESH" or obj == source:
+			continue
+		for modifier in obj.modifiers:
+			if modifier.type == "ARMATURE" and modifier.object == source:
+				found.append(obj)
+				break
+		if obj.parent == source and obj not in found:
+			found.append(obj)
+	return [obj for obj in found if not _driven_by(obj, pes_arm)]
+
+
+def _scale_rig_uniform(context, source, pes_arm, meshes):
+	"""One scale for the whole rig so the neck and the soles match, hips included.
+
+	Limb posing comes after this. The dress is not the origin. The hip bone is.
+	"""
+	hip_name = None
+	neck_name = None
+	available = {bone.name for bone in pes_arm.data.bones}
+	for bone in source.data.bones:
+		role = map_group_name(bone.name, available)
+		if role == "dsk_hip" and (hip_name is None or bone.name.lower() in ("hip", "hips")):
+			hip_name = bone.name
+		if role == "sk_neck" and (neck_name is None or bone.name.lower() == "neck"):
+			neck_name = bone.name
+	if hip_name is None or neck_name is None:
+		return
+	medic_hip = _bone_world(pes_arm, "dsk_hip")
+	medic_neck = _bone_world(pes_arm, "sk_neck")
+	if medic_hip is None or medic_neck is None:
+		return
+	context.view_layer.objects.active = source
+	if context.object.mode != "OBJECT":
+		bpy.ops.object.mode_set(mode="OBJECT")
+	bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+	context.view_layer.update()
+	src_hip = source.matrix_world @ source.data.bones[hip_name].head_local
+	src_neck = source.matrix_world @ source.data.bones[neck_name].head_local
+	src_foot = None
+	for obj in meshes:
+		for vertex in obj.data.vertices:
+			z = (obj.matrix_world @ vertex.co).z
+			if src_foot is None or z < src_foot:
+				src_foot = z
+	med_foot = None
+	for obj in bpy.data.objects:
+		if obj.type != "MESH" or not _driven_by(obj, pes_arm):
+			continue
+		for vertex in obj.data.vertices:
+			z = (obj.matrix_world @ vertex.co).z
+			if med_foot is None or z < med_foot:
+				med_foot = z
+	if src_foot is None or med_foot is None:
+		return
+	span = src_neck.z - src_foot
+	if span < 1e-4:
+		return
+	scale = (medic_neck.z - med_foot) / span
+	if scale < 0.02 or scale > 50.0:
+		return
+	origin = Vector((src_hip.x, src_hip.y, src_foot))
+
+	def place(point):
+		return origin + (point - origin) * scale + Vector((
+			medic_hip.x - src_hip.x,
+			medic_hip.y - src_hip.y,
+			0.0,
+		))
+
+	inverse = source.matrix_world.inverted()
+	bpy.ops.object.mode_set(mode="EDIT")
+	for bone in source.data.edit_bones:
+		bone.head = inverse @ place(source.matrix_world @ bone.head)
+		bone.tail = inverse @ place(source.matrix_world @ bone.tail)
+	bpy.ops.object.mode_set(mode="OBJECT")
+	for obj in meshes:
+		matrix = obj.matrix_world.copy()
+		back = matrix.inverted()
+		for vertex in obj.data.vertices:
+			vertex.co = back @ place(matrix @ vertex.co)
+		obj.data.update()
+	context.view_layer.update()
+
+
+def _chain_child(source, bone_name, next_role, available):
+	"""The child that continues this limb. Twists and offsets do not."""
+	bone = source.data.bones.get(bone_name)
+	if bone is None:
+		return None
+	found = []
+	for child in bone.children:
+		lower = child.name.lower()
+		if any(token in lower for token in ("roll", "twist", "offset", "捩")):
+			continue
+		if map_group_name(child.name, available) == next_role:
+			found.append(child)
+	if not found:
+		return None
+	# The continuation sits on the parent tail. A side bone that shares the
+	# same PES name does not.
+	return min(found, key=lambda child: (child.head_local - bone.tail_local).length)
+
+
+def _validate_rig(context, source):
+	"""First step of a rigged convert. Fix only what is already true.
+
+	A parented bone is connected only when its head is already on the parent
+	tail. A thigh, a shoulder, and a twist sit off that tail on purpose.
+	Connecting those would move the pivot. The icosphere is the bone's
+	display shape, not a second joint.
+	"""
+	notes = []
+	context.view_layer.objects.active = source
+	if context.object.mode != "OBJECT":
+		bpy.ops.object.mode_set(mode="OBJECT")
+	location, rotation, scale = source.matrix_world.decompose()
+	off_scale = (scale - Vector((1.0, 1.0, 1.0))).length > 0.001
+	off_spin = abs(rotation.angle) > 0.001
+	off_move = location.length > 0.001
+	if off_scale or off_spin or off_move:
+		bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+		context.view_layer.update()
+		notes.append("applied the armature object transform")
+	if any(bone.custom_shape is not None for bone in source.pose.bones):
+		notes.append("bone spheres are display shapes on the bone heads")
+	joined = 0
+	offset = 0
+	zero = 0
+	for bone in source.data.bones:
+		if (bone.tail_local - bone.head_local).length < 1e-5:
+			zero += 1
+		if bone.parent is None:
+			continue
+		gap = (bone.head_local - bone.parent.tail_local).length
+		if gap <= 0.002:
+			joined += 1
+		else:
+			offset += 1
+	notes.append("connected %d joints that already met the parent tail" % joined)
+	notes.append("left %d offset joints parented" % offset)
+	if zero:
+		notes.append("%d zero-length bones skipped" % zero)
+	return notes
+
+
+def _connect_meeting_joints(context, source):
+	"""Connect a bone only after the scale, and only if it already meets."""
+	context.view_layer.objects.active = source
+	if context.object.mode != "OBJECT":
+		bpy.ops.object.mode_set(mode="OBJECT")
+	bpy.ops.object.mode_set(mode="EDIT")
+	for bone in source.data.edit_bones:
+		if bone.parent is None or bone.use_connect:
+			continue
+		if (bone.head - bone.parent.tail).length <= 0.002:
+			bone.use_connect = True
+	bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def _pose_source_to_medic(context, mesh, pes_arm):
+	"""Scale the whole rig, then rotate each bone toward the medic.
+
+	Bone length stays. Other children stay where they are parented. Scaling
+	a bone and snapping every child onto its tail is what shredded the mesh.
+	"""
+	source = None
+	for modifier in mesh.modifiers:
+		if modifier.type == "ARMATURE" and modifier.object is not None and modifier.object != pes_arm:
+			source = modifier.object
+			break
+	if source is None:
+		return []
+	notes = _validate_rig(context, source)
+	rig_meshes = _driven_meshes(source, pes_arm)
+	if mesh not in rig_meshes:
+		rig_meshes.append(mesh)
+	_scale_rig_uniform(context, source, pes_arm, rig_meshes)
+	_connect_meeting_joints(context, source)
+	available = {bone.name for bone in pes_arm.data.bones}
+	jobs = []
+	for bone in source.data.bones:
+		lower = bone.name.lower()
+		if any(token in lower for token in ("roll", "twist", "offset", "捩")):
+			continue
+		if (bone.tail_local - bone.head_local).length < 1e-5:
+			continue
+		role = map_group_name(bone.name, available)
+		child_name = _POSE_NEXT.get(role)
+		if not child_name or pes_arm.data.bones.get(child_name) is None:
+			continue
+		if pes_arm.data.bones.get(role) is None:
+			continue
+		if _chain_child(source, bone.name, child_name, available) is None:
+			continue
+		count = 0
+		parent = bone
+		while parent.parent is not None:
+			count += 1
+			parent = parent.parent
+		jobs.append((count, bone.name, role, child_name))
+	jobs.sort()
+	context.view_layer.objects.active = source
+	if context.object.mode != "POSE":
+		bpy.ops.object.mode_set(mode="POSE")
+	for _depth, name, role, child_name in jobs:
+		pose_bone = source.pose.bones.get(name)
+		child_data = _chain_child(source, name, child_name, available)
+		child_pose = source.pose.bones.get(child_data.name) if child_data else None
+		if pose_bone is None or child_pose is None:
+			continue
+		head = source.matrix_world @ pose_bone.head
+		child_head = source.matrix_world @ child_pose.head
+		current = child_head - head
+		medic_parent = pes_arm.matrix_world @ pes_arm.data.bones[role].head_local
+		medic_child = pes_arm.matrix_world @ pes_arm.data.bones[child_name].head_local
+		target = medic_child - medic_parent
+		if current.length < 1e-5 or target.length < 1e-5:
+			continue
+		delta = current.normalized().rotation_difference(target.normalized())
+		# A backwards direction means we picked the wrong child or the bone
+		# points the other way. Flipping it turns the chest inside out.
+		if abs(delta.angle) < 0.02 or abs(delta.angle) > 1.05:
+			if abs(delta.angle) > 1.05:
+				notes.append("left %s unposed" % name)
+			continue
+		world = source.matrix_world @ pose_bone.matrix
+		turn = Matrix.Translation(head) @ delta.to_matrix().to_4x4() @ Matrix.Translation(-head)
+		pose_bone.matrix = source.matrix_world.inverted() @ (turn @ world)
+		context.view_layer.update()
+	if context.object.mode != "OBJECT":
+		bpy.ops.object.mode_set(mode="OBJECT")
+	# The medic limbs sit further forward than a straight stance. Slide the
+	# whole rig, mesh included, until the knees and elbows lie on those bones.
+	# One slide. No per-bone scale.
+	_seat_limbs_inside(source, pes_arm, rig_meshes)
+	notes.extend(_extend_source_arms(source, pes_arm))
+	return notes
+
+
+def _body_bone_for_role(source, available, role, prefer):
+	"""The body bone for a PES role. Rolls and offsets are not it."""
+	best = None
+	best_rank = 99
+	for bone in source.data.bones:
+		if map_group_name(bone.name, available) != role:
+			continue
+		lower = bone.name.lower()
+		if any(token in lower for token in ("roll", "twist", "offset", "捩")):
+			continue
+		rank = 5
+		for index, token in enumerate(prefer):
+			if token in lower:
+				rank = index
+				break
+		if rank < best_rank:
+			best_rank = rank
+			best = bone
+	return best
+
+
+def _extend_source_arms(source, pes_arm):
+	"""Lengthen the arm bones on their own axis until the wrist reaches.
+
+	The body scale has already matched the neck and the soles. A narrow
+	shoulder is still short of the medic wrist, so this scale is on top of
+	that. NONE_LEGACY lets a parent scale move the child joint without
+	scaling the child. The painted elbow stays on the elbow bone. Fingers
+	are not grown. Vertices are not moved by hand.
+	"""
+	notes = []
+	available = {bone.name for bone in pes_arm.data.bones}
+	for side, upper_role, fore_role in (
+		("l", "dsk_upperarm_l", "sk_forearm_l"),
+		("r", "dsk_upperarm_r", "sk_forearm_r"),
+	):
+		arm_bone = _body_bone_for_role(source, available, upper_role, ("arm",))
+		elbow_bone = _body_bone_for_role(source, available, fore_role, ("elbow", "fore"))
+		wrist_bone = _body_bone_for_role(source, available, "sk_hand_%s" % side, ("wrist", "hand"))
+		if wrist_bone is None:
+			wrist_bone = _body_bone_for_role(source, available, "dsk_wrist_%s" % side, ("wrist", "hand"))
+		medic_wrist = _bone_world(pes_arm, "dsk_wrist_%s" % side) or _bone_world(pes_arm, "sk_hand_%s" % side)
+		if None in (arm_bone, elbow_bone, wrist_bone, medic_wrist):
+			continue
+		for bone in (elbow_bone, wrist_bone):
+			bone.inherit_scale = "NONE_LEGACY"
+			for child in bone.children:
+				child.inherit_scale = "NONE_LEGACY"
+		arm_pose = source.pose.bones.get(arm_bone.name)
+		elbow_pose = source.pose.bones.get(elbow_bone.name)
+		wrist_pose = source.pose.bones.get(wrist_bone.name)
+		if None in (arm_pose, elbow_pose, wrist_pose):
+			continue
+		arm_head = source.matrix_world @ arm_pose.head
+		wrist_head = source.matrix_world @ wrist_pose.head
+		axis = wrist_head - arm_head
+		if axis.length < 1e-4:
+			continue
+		direction = axis.normalized()
+		current = (wrist_head - arm_head).dot(direction)
+		target = (medic_wrist - arm_head).dot(direction)
+		if current < 1e-4 or target <= current * 1.02:
+			continue
+		# This is the extra reach after the body scale, not a second copy of
+		# it. Clamping it to 1.2 left the wrist about 10 cm short, in the palm.
+		factor = target / current
+		if factor > 2.0:
+			notes.append("arm %s scale %.2f refused" % (side, factor))
+			continue
+		notes.append("arm %s scale %.2f" % (side, factor))
+		# The same factor on both bones keeps the elbow on the painted elbow.
+		arm_pose.scale.y *= factor
+		bpy.context.view_layer.update()
+		elbow_pose.scale.y *= factor
+		bpy.context.view_layer.update()
+	return notes
+
+
+def _seat_limbs_inside(source, pes_arm, meshes):
+	pairs = (
+		("Knee_L", "sk_leg_l"),
+		("Knee_R", "sk_leg_r"),
+		("Ankle_L", "sk_foot_l"),
+		("Ankle_R", "sk_foot_r"),
+		("Elbow_L", "sk_forearm_l"),
+		("Elbow_R", "sk_forearm_r"),
+		("Wrist_L", "sk_hand_l"),
+		("Wrist_R", "sk_hand_r"),
+	)
+	errors = []
+	for src_name, pes_name in pairs:
+		pose_bone = source.pose.bones.get(src_name)
+		medic = pes_arm.data.bones.get(pes_name)
+		if pose_bone is None or medic is None:
+			continue
+		src_head = source.matrix_world @ pose_bone.head
+		medic_head = pes_arm.matrix_world @ medic.head_local
+		errors.append(medic_head.y - src_head.y)
+	if not errors:
+		return
+	errors.sort()
+	delta = errors[len(errors) // 2]
+	if abs(delta) < 0.01:
+		return
+	matrix = source.matrix_world.copy()
+	matrix.translation.y += delta
+	source.matrix_world = matrix
+	for obj in meshes:
+		if obj.parent == source:
+			continue
+		obj_matrix = obj.matrix_world.copy()
+		obj_matrix.translation.y += delta
+		obj.matrix_world = obj_matrix
+
+
+def _ease_joints(mesh, weights, pes_arm):
+	"""Keep the cap of a joint on the bone above it.
+
+	Almond Eye's knee is still mostly the thigh. The calf takes over a few
+	centimetres down the shin, so a bend clips instead of pinching the mesh
+	into the joint. The same idea holds the shoulder on the clavicle.
+	"""
+	matrix = mesh.matrix_world
+	for side in ("l", "r"):
+		thigh = _bone_world(pes_arm, "sk_thigh_%s" % side)
+		knee = _bone_world(pes_arm, "sk_leg_%s" % side)
+		if thigh is not None and knee is not None:
+			direction = knee - thigh
+			if direction.length > 1e-5:
+				direction = direction.normalized()
+				for index, bucket in weights.items():
+					total = bucket.get("sk_thigh_%s" % side, 0.0) + bucket.get("sk_leg_%s" % side, 0.0)
+					if total < 0.45:
+						continue
+					point = matrix @ mesh.data.vertices[index].co
+					if (point - knee).length > 0.09:
+						continue
+					along = (point - knee).dot(direction)
+					if along <= -0.04:
+						leg_share = 0.0
+					elif along >= 0.04:
+						leg_share = 1.0
+					elif along <= 0.0:
+						leg_share = 0.25 * (along + 0.04) / 0.04
+					else:
+						leg_share = 0.25 + 0.75 * (along / 0.04)
+					bucket["sk_thigh_%s" % side] = total * (1.0 - leg_share)
+					bucket["sk_leg_%s" % side] = total * leg_share
+		shoulder = _bone_world(pes_arm, "dsk_upperarm_%s" % side)
+		elbow = _bone_world(pes_arm, "sk_forearm_%s" % side)
+		if shoulder is None or elbow is None:
+			continue
+		axis = elbow - shoulder
+		if axis.length < 1e-5:
+			continue
+		axis = axis.normalized()
+		upper_name = "dsk_upperarm_%s" % side
+		clav_name = "dsk_clavicle_%s" % side
+		up = Vector((0.0, 0.0, 1.0))
+		for index, bucket in weights.items():
+			upper = bucket.get(upper_name, 0.0)
+			if upper < 0.25:
+				continue
+			point = matrix @ mesh.data.vertices[index].co
+			offset = point - shoulder
+			along = offset.dot(axis)
+			if along < -0.02 or along > 0.08 or offset.length > 0.10:
+				continue
+			# Above the bone is the top of the shoulder. It stays put when
+			# the arm lifts. Below the bone is the armpit, and that stretches.
+			if offset.dot(up) <= 0.0:
+				continue
+			moved = upper * 0.8
+			bucket[upper_name] = upper - moved
+			bucket[clav_name] = bucket.get(clav_name, 0.0) + moved
+
+
+def _scale_arm_to_wrist(mesh, weights, pes_arm):
+	"""Stretch each arm along its own axis until the wrist reaches the bone.
+
+	Girth stays. The shoulder stays. Source bones are not scaled, so an
+	unparented twist bone cannot drag the mesh apart.
+	"""
+	matrix = mesh.matrix_world
+	inverse = matrix.inverted()
+	for side in ("l", "r"):
+		shoulder = _bone_world(pes_arm, "dsk_upperarm_%s" % side)
+		wrist = _bone_world(pes_arm, "dsk_wrist_%s" % side) or _bone_world(pes_arm, "sk_hand_%s" % side)
+		if shoulder is None or wrist is None:
+			continue
+		axis = wrist - shoulder
+		reach = axis.length
+		if reach < 1e-5:
+			continue
+		direction = axis / reach
+		hands = []
+		for index, bucket in weights.items():
+			hand = bucket.get("sk_hand_%s" % side, 0.0) + bucket.get("dsk_wrist_%s" % side, 0.0)
+			if hand < 0.5:
+				continue
+			hands.append(matrix @ mesh.data.vertices[index].co)
+		if len(hands) < 8:
+			continue
+		center = sum(hands, Vector()) / len(hands)
+		along = (center - shoulder).dot(direction)
+		if along < reach * 0.4:
+			continue
+		factor = reach / along
+		if factor < 1.02 or factor > 1.35:
+			factor = max(1.0, min(1.35, factor))
+			if factor < 1.02:
+				continue
+		names = _ARM_GROUPS[side]
+		for index, bucket in weights.items():
+			arm_weight = sum(bucket.get(name, 0.0) for name in names)
+			if arm_weight < 0.25:
+				continue
+			chest = bucket.get("sk_chest", 0.0) + bucket.get("dsk_clavicle_%s" % side, 0.0)
+			if chest > arm_weight:
+				continue
+			point = matrix @ mesh.data.vertices[index].co
+			delta = point - shoulder
+			along = delta.dot(direction)
+			if along <= 0.0:
+				continue
+			perp = delta - direction * along
+			moved = shoulder + direction * along * factor + perp
+			mesh.data.vertices[index].co = inverse @ point.lerp(moved, min(arm_weight, 1.0))
+	mesh.data.update()
+	_seat_arm_on_bone(mesh, weights, pes_arm)
+
+
+def _seat_arm_on_bone(mesh, weights, pes_arm):
+	"""Slide the sleeve onto the arm bone. Girth stays.
+
+	The length scale leaves the sleeve beside the bone. Bending the shoulder
+	or the elbow then swings the bone out of the arm. Both arms do this.
+	"""
+	matrix = mesh.matrix_world
+	inverse = matrix.inverted()
+	for side in ("l", "r"):
+		shoulder = _bone_world(pes_arm, "dsk_upperarm_%s" % side)
+		wrist = _bone_world(pes_arm, "dsk_wrist_%s" % side) or _bone_world(pes_arm, "sk_hand_%s" % side)
+		if shoulder is None or wrist is None:
+			continue
+		axis = wrist - shoulder
+		reach = axis.length
+		if reach < 1e-5:
+			continue
+		direction = axis / reach
+		names = _ARM_GROUPS[side]
+		samples = []
+		for index, bucket in weights.items():
+			arm_weight = sum(bucket.get(name, 0.0) for name in names)
+			if arm_weight < 0.35:
+				continue
+			chest = bucket.get("sk_chest", 0.0) + bucket.get("dsk_clavicle_%s" % side, 0.0)
+			if chest > arm_weight:
+				continue
+			point = matrix @ mesh.data.vertices[index].co
+			along = (point - shoulder).dot(direction)
+			if along < 0.0 or along > reach + 0.04:
+				continue
+			samples.append((index, along, point, arm_weight))
+		if len(samples) < 20:
+			continue
+		bins = {}
+		for item in samples:
+			bins.setdefault(int(item[1] / 0.04), []).append(item)
+		shift = {}
+		for key, items in bins.items():
+			center = sum((item[2] for item in items), Vector()) / len(items)
+			line = shoulder + direction * (key * 0.04 + 0.02)
+			shift[key] = center - line
+		for index, along, point, arm_weight in samples:
+			offset = shift.get(int(along / 0.04))
+			if offset is None:
+				continue
+			fade = min(1.0, max(0.0, along / 0.06))
+			moved = point - offset * fade
+			mesh.data.vertices[index].co = inverse @ point.lerp(moved, min(arm_weight, 1.0))
+	mesh.data.update()
 
 
 def _apply_source_armatures(context, mesh, pes_arm):
@@ -958,12 +1506,15 @@ def _fit_to_medic(context, mesh, pes_arm, weights):
 	# The medic mesh has no head, so its box stops at the neck.
 	points = [mesh.matrix_world @ vertex.co for vertex in mesh.data.vertices]
 	# The medic mesh ends at the neck. Line the necks up. Ears and hair sit above that.
-	# The collar verts rise past the neck joint, so the joint is the match, not the mesh tip.
+	# The collar verts rise past the neck joint. Match the joint, or the
+	# bone sits in the jaw and the head bobs when it turns.
 	neck_points = _weight_points(mesh, weights, ("sk_neck",), 0.35)
 	dst_neck = _medic_neck(pes_arm)
 	if points and neck_points and dst_neck is not None and medic is not None and len(medic.data.vertices) > 0:
 		src_foot = min(point.z for point in points)
-		src_top = sum(point.z for point in neck_points) / len(neck_points)
+		src_top = _source_joint_z(context, pes_arm, "sk_neck")
+		if src_top is None:
+			src_top = sum(point.z for point in neck_points) / len(neck_points)
 		dst_foot = min((medic.matrix_world @ vertex.co).z for vertex in medic.data.vertices)
 		dst_top = dst_neck
 	elif points:
@@ -984,7 +1535,13 @@ def _fit_to_medic(context, mesh, pes_arm, weights):
 	scale = dst_height / src_height
 	if scale < 0.02 or scale > 50.0:
 		return _fit_identity()
-	src_x, src_y, _low = _hip_xy(mesh, weights)
+	# The hip bone, not the hip-weighted centroid. The train and the tail
+	# sit on that group and pull the centroid backward.
+	hip_joint = _source_joint(context, pes_arm, "dsk_hip")
+	if hip_joint is not None:
+		src_x, src_y = hip_joint.x, hip_joint.y
+	else:
+		src_x, src_y, _low = _hip_xy(mesh, weights)
 	origin = Vector((src_x, src_y, src_foot))
 	target = Vector((src_x, src_y, dst_foot))
 	# A neck already on the medic neck stays put. Ears above it are not a reason to scale.
@@ -1005,6 +1562,36 @@ def _source_armatures(context, pes_arm):
 		if obj.type == "ARMATURE" and obj != pes_arm and not _is_pes_armature(obj):
 			found.append(obj)
 	return found
+
+
+def _source_joint(context, pes_arm, role):
+	"""World position of the source bone for a PES role. Twist bones lose."""
+	best = None
+	best_rank = 999
+	for arm in _source_armatures(context, pes_arm):
+		for bone in arm.data.bones:
+			if map_group_name(bone.name, {role}) != role:
+				continue
+			compact = _compact(_split_side(bone.name)[0])
+			rank = 0 if compact in ("neck", "head", "chest", "hip") or compact == role else 10
+			if "roll" in compact or "twist" in compact:
+				rank += 20
+			if rank < best_rank:
+				best_rank = rank
+				posed = arm.pose.bones.get(bone.name) if arm.pose else None
+				if posed is not None:
+					best = arm.matrix_world @ posed.head
+				else:
+					best = arm.matrix_world @ bone.head_local
+	return best
+
+
+def _source_joint_z(context, pes_arm, role):
+	"""World Z of the source bone for a PES role. Twist bones lose to the real joint."""
+	point = _source_joint(context, pes_arm, role)
+	if point is None:
+		return None
+	return point.z
 
 
 def _joint_from_sources(armatures, named, role, prefer):
@@ -1091,25 +1678,10 @@ def _scale_arms(context, mesh, pes_arm, weights, named, fit):
 	))
 	matrix = mesh.matrix_world.copy()
 	inverse = matrix.inverted()
+	# Legs stay on the stance she was built with. Aiming the foot at the
+	# medic toe steps it forward, and the torso then looks leaned back.
 	moves = []
 	chains = []
-	for side in ("l", "r"):
-		chains.append((
-			"arm_%s" % side,
-			("dsk_upperarm_%s" % side, "sk_upperarm_%s" % side),
-			("sk_hand_%s" % side, "dsk_wrist_%s" % side),
-			("dsk_upperarm_%s" % side, "sk_upperarm_%s" % side),
-			("sk_hand_%s" % side, "dsk_wrist_%s" % side),
-			_ARM_GROUPS[side],
-		))
-		chains.append((
-			"leg_%s" % side,
-			("sk_thigh_%s" % side, "dsk_thigh_%s" % side),
-			("dsk_toe_%s" % side, "sk_foot_%s" % side),
-			("sk_thigh_%s" % side,),
-			("dsk_toe_%s" % side, "sk_foot_%s" % side),
-			_LEG_GROUPS[side],
-		))
 	for key, prox_roles, dist_roles, prox_bones, dist_bones, _groups in chains:
 		# The arm pivots on the shoulder the mesh already has. The medic
 		# shoulder is wider, and moving onto it scrunches the deltoid.
@@ -1161,8 +1733,6 @@ def _scale_arms(context, mesh, pes_arm, weights, named, fit):
 			length_scale = max(0.82, min(1.18, length_scale))
 		rotation = src.rotation_difference(dst)
 		moves.append((key, proximal, src.normalized(), src.length, length_scale, rotation, _groups))
-	if not moves:
-		return {}
 	for index, bucket in weights.items():
 		world = matrix @ mesh.data.vertices[index].co
 		best = None
@@ -1208,10 +1778,264 @@ def _scale_arms(context, mesh, pes_arm, weights, named, fit):
 			blend *= (along_amt + 0.05) / 0.05
 		mesh.data.vertices[index].co = inverse @ world.lerp(scaled, blend)
 	mesh.data.update()
+	depth = _spine_depth_delta(mesh, pes_arm)
+	if abs(depth) >= 0.015:
+		_apply_spine_depth(mesh, pes_arm, depth)
+	arm_scales = _bend_arms(context, mesh, weights, pes_arm, named, fit, depth)
 	# After the arm is on the bone. Before that, the T-pose sleeve is not
 	# along sk_forearm, so the elbow test misses it and the upper arm keeps it.
 	_seat_forearm(mesh, weights, pes_arm)
-	return {key: length_scale for key, _prox, _axis, _reach, length_scale, _rot, _groups in moves}
+	_neck_meets_head(mesh, weights, pes_arm)
+	_seat_leg_skin(mesh, weights, pes_arm)
+	scales = {key: length_scale for key, _prox, _axis, _reach, length_scale, _rot, _groups in moves}
+	scales.update(arm_scales)
+	return scales
+
+
+def _clamp_limb(scale):
+	# A T-pose arm has to grow to reach an A-pose elbow. 1.18 was too tight
+	# and left the sleeve short of the joint.
+	if scale < 0.65 or scale > 1.45:
+		return max(0.65, min(1.45, scale))
+	return scale
+
+
+def _along_point(point, origin, axis, scale, rotation):
+	"""Length-only move. The girth of the limb stays put."""
+	delta = point - origin
+	along = axis.dot(delta)
+	perp = delta - axis * along
+	return origin + rotation @ (axis * along * scale + perp)
+
+
+def _spine_factor(point, hip, neck):
+	span = neck.z - hip.z
+	if span < 1e-4:
+		return 0.0
+	t = (point.z - hip.z) / span
+	if t <= 0.0:
+		return 0.0
+	if t >= 1.0:
+		return 1.0
+	return t * t * (3.0 - 2.0 * t)
+
+
+def _spine_depth_delta(mesh, pes_arm):
+	"""How far the neck mesh sits behind the neck bone, in Y.
+
+	Positive Y is back. The medic neck is in front of the hips. Her neck
+	is not, so the bone ends up in front of the mesh and a turn swings it.
+	"""
+	neck = _bone_world(pes_arm, "sk_neck")
+	if neck is None:
+		return 0.0
+	matrix = mesh.matrix_world
+	samples = []
+	for vertex in mesh.data.vertices:
+		point = matrix @ vertex.co
+		if abs(point.x) > 0.08:
+			continue
+		if not (neck.z - 0.03 <= point.z <= neck.z + 0.05):
+			continue
+		if point.y > neck.y + 0.12:
+			continue
+		samples.append(point.y)
+	if len(samples) < 12:
+		return 0.0
+	samples.sort()
+	return neck.y - samples[len(samples) // 2]
+
+
+def _apply_spine_depth(mesh, pes_arm, delta):
+	"""Bring the chest and the neck forward onto the bones. The feet stay."""
+	hip = _bone_world(pes_arm, "dsk_hip")
+	neck = _bone_world(pes_arm, "sk_neck")
+	if hip is None or neck is None:
+		return
+	matrix = mesh.matrix_world.copy()
+	inverse = matrix.inverted()
+	for vertex in mesh.data.vertices:
+		point = matrix @ vertex.co
+		# The train and the tail hang behind the hips. They are not the spine.
+		if point.y > hip.y + 0.12 and point.z < neck.z - 0.08:
+			continue
+		factor = _spine_factor(point, hip, neck)
+		if factor <= 0.0:
+			continue
+		point.y += delta * factor
+		vertex.co = inverse @ point
+	mesh.data.update()
+
+
+def _bend_arms(context, mesh, weights, pes_arm, named, fit, depth):
+	"""Seat the upper arm and the forearm on their own bones.
+
+	One rotation from the shoulder to the hand pulls a T-pose arm into a
+	straight line. The medic arm bends at the elbow, so that line misses
+	the joint and the sleeve folds like a noodle.
+	"""
+	armatures = _source_armatures(context, pes_arm)
+	matrix = mesh.matrix_world
+	inverse = matrix.inverted()
+	posed = []
+	for side in ("l", "r"):
+		shoulder = None
+		for role in ("dsk_upperarm_%s" % side, "sk_upperarm_%s" % side):
+			shoulder = _joint_from_sources(armatures, named, role, ("upperarm", "arm"))
+			if shoulder is not None:
+				shoulder = _mapped_point(shoulder, fit)
+				break
+		elbow = _joint_from_sources(armatures, named, "sk_forearm_%s" % side, ("elbow", "forearm"))
+		wrist = _end_point(mesh, weights, ("sk_hand_%s" % side, "dsk_wrist_%s" % side), None, "near")
+		if elbow is not None:
+			elbow = _mapped_point(elbow, fit)
+		if wrist is None:
+			wrist = _joint_from_sources(armatures, named, "sk_hand_%s" % side, ("hand", "wrist"))
+			if wrist is not None:
+				wrist = _mapped_point(wrist, fit)
+		hip = _bone_world(pes_arm, "dsk_hip")
+		neck = _bone_world(pes_arm, "sk_neck")
+		if abs(depth) >= 0.015 and hip is not None and neck is not None:
+			for point in (shoulder, elbow, wrist):
+				if point is None:
+					continue
+				point.y += depth * _spine_factor(point, hip, neck)
+		medic_shoulder = _bone_world(pes_arm, "dsk_upperarm_%s" % side)
+		medic_elbow = _bone_world(pes_arm, "sk_forearm_%s" % side)
+		medic_hand = _bone_world(pes_arm, "sk_hand_%s" % side)
+		if None in (shoulder, elbow, wrist, medic_shoulder, medic_elbow, medic_hand):
+			continue
+		src_upper = elbow - shoulder
+		# From the mesh shoulder, not the wider medic shoulder. The root
+		# stays. The elbow still has to land on the medic elbow.
+		dst_upper = medic_elbow - shoulder
+		src_fore = wrist - elbow
+		dst_fore = medic_hand - medic_elbow
+		if min(src_upper.length, dst_upper.length, src_fore.length, dst_fore.length) < 1e-4:
+			continue
+		upper_axis = src_upper.normalized()
+		posed.append({
+			"side": side,
+			"shoulder": shoulder,
+			"elbow": elbow,
+			"upper_axis": upper_axis,
+			"fore_axis": src_fore.normalized(),
+			"scale_u": _clamp_limb(dst_upper.length / src_upper.length),
+			"scale_f": _clamp_limb(dst_fore.length / src_fore.length),
+			"rot_u": src_upper.rotation_difference(dst_upper),
+			"rot_f": src_fore.rotation_difference(dst_fore),
+			"elbow_along": src_upper.dot(upper_axis),
+		})
+	scales = {}
+	if not posed:
+		return scales
+	for index, bucket in weights.items():
+		world = matrix @ mesh.data.vertices[index].co
+		best = None
+		best_weight = 0.0
+		for arm in posed:
+			side = arm["side"]
+			weight = sum(bucket.get(name, 0.0) for name in _ARM_GROUPS[side])
+			if weight < 0.25:
+				clav = bucket.get("dsk_clavicle_%s" % side, 0.0)
+				if clav >= 0.35 and (world - arm["shoulder"]).length <= 0.12:
+					weight = clav
+			if weight > best_weight:
+				best_weight = weight
+				best = arm
+		if best is None or best_weight < 0.25:
+			continue
+		torso = sum(bucket.get(name, 0.0) for name in ("dsk_hip", "sk_belly", "sk_chest", "sk_neck"))
+		if torso >= best_weight and torso >= 0.35:
+			continue
+		delta = world - best["shoulder"]
+		along = best["upper_axis"].dot(delta)
+		if along < -0.05:
+			continue
+		upper = _along_point(world, best["shoulder"], best["upper_axis"], best["scale_u"], best["rot_u"])
+		elbow2 = _along_point(best["elbow"], best["shoulder"], best["upper_axis"], best["scale_u"], best["rot_u"])
+		fore_delta = world - best["elbow"]
+		fore_along = best["fore_axis"].dot(fore_delta)
+		fore_perp = fore_delta - best["fore_axis"] * fore_along
+		fore = elbow2 + best["rot_f"] @ (best["fore_axis"] * fore_along * best["scale_f"] + fore_perp)
+		# Cross the elbow over a few centimetres so the sleeve does not crease.
+		span = along - (best["elbow_along"] - 0.03)
+		if span <= 0.0:
+			scaled = upper
+		elif span >= 0.06:
+			scaled = fore
+		else:
+			scaled = upper.lerp(fore, span / 0.06)
+		blend = min(best_weight, 1.0)
+		if along < 0.0:
+			blend *= (along + 0.05) / 0.05
+		mesh.data.vertices[index].co = inverse @ world.lerp(scaled, blend)
+		scales["arm_%s" % best["side"]] = best["scale_u"]
+		scales["fore_%s" % best["side"]] = best["scale_f"]
+	mesh.data.update()
+	return scales
+
+
+def _neck_meets_head(mesh, weights, pes_arm):
+	"""The neck joint owns the neck. The collar above it owns the head.
+
+	A neck weight that climbs into the jaw stays put when the head turns,
+	so the face bobs on top of it.
+	"""
+	neck = _bone_world(pes_arm, "sk_neck")
+	head = _bone_world(pes_arm, "sk_head")
+	if neck is None or head is None:
+		return
+	limit = neck.z + 0.04
+	matrix = mesh.matrix_world
+	for index, bucket in weights.items():
+		amount = bucket.get("sk_neck", 0.0)
+		if amount < 0.05:
+			continue
+		point = matrix @ mesh.data.vertices[index].co
+		if point.z <= limit or _axis_radius(point, neck) > 0.15:
+			continue
+		bucket.pop("sk_neck", None)
+		bucket["sk_head"] = bucket.get("sk_head", 0.0) + amount
+
+
+def _seat_leg_skin(mesh, weights, pes_arm):
+	"""The back of the thigh is the leg. The tail and the skirt are not.
+
+	Uma paints the hip bone down the hamstring. A vert wrapped on the leg
+	bone follows that leg. A sheet farther out stays on the hip.
+	"""
+	hanging = _hanging_appendage(mesh, pes_arm)
+	matrix = mesh.matrix_world
+	protected = ("sk_head", "sk_neck", "sk_chest", "sk_belly")
+	for side in ("l", "r"):
+		thigh = _bone_world(pes_arm, "sk_thigh_%s" % side)
+		knee = _bone_world(pes_arm, "sk_leg_%s" % side)
+		foot = _bone_world(pes_arm, "sk_foot_%s" % side)
+		if thigh is None or knee is None or foot is None:
+			continue
+		for index, bucket in weights.items():
+			if index in hanging:
+				continue
+			hip_weight = bucket.get("dsk_hip", 0.0)
+			if hip_weight < 0.35:
+				continue
+			if any(bucket.get(name, 0.0) > 0.35 for name in protected):
+				continue
+			point = matrix @ mesh.data.vertices[index].co
+			if point.z > thigh.z - 0.02:
+				continue
+			if side == "l" and point.x < -0.01:
+				continue
+			if side == "r" and point.x > 0.01:
+				continue
+			dist = min(_seg_dist(point, thigh, knee), _seg_dist(point, knee, foot))
+			# The hamstring is just behind the bone. The skirt and the tail are not.
+			if dist > 0.14 or point.y > thigh.y + 0.08:
+				continue
+			dest = "sk_thigh_%s" % side if point.z >= knee.z else "sk_leg_%s" % side
+			bucket[dest] = bucket.get(dest, 0.0) + hip_weight
+			bucket.pop("dsk_hip", None)
 
 
 def _seat_forearm(mesh, weights, pes_arm):
@@ -2271,12 +3095,21 @@ def retarget_to_pes(context, medic_path, clean=True):
 	if not meshes:
 		raise ValueError("Select the imported model. The medic mesh is left as the skeleton reference.")
 	mesh = _join(context, meshes)
+	# Pose her own skeleton onto the medic, at the bone heads, before the
+	# mesh is baked. Dragging vertices is the boneless path.
+	rig_notes = _pose_source_to_medic(context, mesh, pes_arm)
 	_apply_source_armatures(context, mesh, pes_arm)
 	weights, named, spatial, skipped, unmapped, _garment = _accumulate(mesh, pes_arm)
 	if not weights:
 		raise ValueError("None of the vertex groups matched a PES bone.")
 	fit = _fit_to_medic(context, mesh, pes_arm, weights)
-	arm_scales = _scale_arms(context, mesh, pes_arm, weights, named, fit)
+	_keep_pelvis(mesh, weights, pes_arm)
+	_keep_shoulders(mesh, weights, pes_arm)
+	_seat_forearm(mesh, weights, pes_arm)
+	_neck_meets_head(mesh, weights, pes_arm)
+	_seat_leg_skin(mesh, weights, pes_arm)
+	_ease_joints(mesh, weights, pes_arm)
+	arm_scales = {}
 	needed = {name for bucket in weights.values() for name in bucket}
 	_add_missing_bones(context, pes_arm, needed)
 	count = _write_groups(mesh, weights)
@@ -2295,6 +3128,7 @@ def retarget_to_pes(context, medic_path, clean=True):
 		"unmapped": unmapped,
 		"scale": fit["scale"],
 		"arms": arm_scales,
+		"rig": rig_notes,
 	}
 
 

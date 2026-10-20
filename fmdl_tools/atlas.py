@@ -278,6 +278,47 @@ def _move_uvs(mesh_obj, material_index, bounds, rect):
 			uv.y = oy + uv.y * sy
 
 
+# The medic body is a blin material. PES paints the mesh red when that shader,
+# or the normal and specular it requires, is missing from the FMDL.
+_PES_COMMON = "/Assets/pes16/model/character/common/sourceimages/"
+
+
+def _tag_image(image, filename, directory, role):
+	for key, value in (
+		("fmdl_texture_filename", filename),
+		("fmdl_texture_directory", directory),
+		("fmdl_texture_role", role),
+	):
+		try:
+			setattr(image, key, value)
+		except (AttributeError, TypeError):
+			pass
+		image[key] = value
+
+
+def _pes_image(name, filename, directory, role):
+	image = bpy.data.images.get(name)
+	if image is None:
+		image = bpy.data.images.new(name, 1, 1, alpha=True)
+	_tag_image(image, filename, directory, role)
+	return image
+
+
+def _pes_blin(material):
+	"""Match the shaded medic: fox3ddf_blin, opaque alpha, a zero mat param."""
+	try:
+		material.fmdl_material_shader = "fox3ddf_blin"
+		material.fmdl_material_technique = "fox3DDF_Blin"
+		material.fmdl_alpha_flags = 128
+		material.fmdl_shadow_flags = 0
+		material.fmdl_material_parameters.clear()
+		param = material.fmdl_material_parameters.add()
+		param.name = "MatParamIndex_0"
+		param.parameters = (0.0, 0.0, 0.0, 0.0)
+	except AttributeError:
+		pass
+
+
 def _body_material(mesh_obj, image):
 	"""One material named body: body.dds into Base Color, alpha 1, out to Surface."""
 	material = bpy.data.materials.get("body")
@@ -291,12 +332,23 @@ def _body_material(mesh_obj, image):
 	shader = nodes.new("ShaderNodeBsdfPrincipled")
 	texture = nodes.new("ShaderNodeTexImage")
 	texture.image = image
+	texture.label = "Base_Tex_SRGB"
+	_tag_image(image, "body.dds", getattr(image, "fmdl_texture_directory", "") or "", "Base_Tex_SRGB")
 	shader.inputs["Alpha"].default_value = 1.0
 	texture.location = (-400, 300)
 	shader.location = (0, 300)
 	output.location = (300, 300)
 	links.new(texture.outputs["Color"], shader.inputs["Base Color"])
 	links.new(shader.outputs["BSDF"], output.inputs["Surface"])
+	for name, filename, role, y in (
+		("pes_dummy_nrm", "dummy_nrm.dds", "NormalMap_Tex_NRM", 80),
+		("pes_dummy_srm", "dummy_srm.dds", "SpecularMap_Tex_LIN", -140),
+	):
+		slot = nodes.new("ShaderNodeTexImage")
+		slot.image = _pes_image(name, filename, _PES_COMMON, role)
+		slot.label = role
+		slot.location = (-400, y)
+	_pes_blin(material)
 	mesh_obj.data.materials.clear()
 	mesh_obj.data.materials.append(material)
 
@@ -331,11 +383,12 @@ def _save_dds(image, directory):
 	image.save()
 	if not os.path.isfile(_NVTT):
 		return dds_path, "NVIDIA Texture Tools is not installed, so only body.png was written."
+	# PES reads FourCC DXT5. bc3n-rxgb writes RXGB, and the compiler skips that.
 	command = [
 		_NVTT,
 		png_path,
 		"-o", dds_path,
-		"-f", "bc3n-rxgb",
+		"-f", "bc3",
 		"--mips",
 		"--mip-filter", "kaiser",
 		"--quality", "normal",
