@@ -3,7 +3,7 @@
 bl_info = {
 	"name": "FMDL tools",
 	"author": "EssexDotDev",
-	"version": (1, 5, 0),
+	"version": (1, 6, 0),
 	"blender": (5, 2, 0),
 	"location": "View3D > Sidebar > FMDL tools",
 	"description": "Merge gloves onto a body, put a mesh on the PES medic skeleton, and pack a body.dds atlas",
@@ -12,7 +12,9 @@ bl_info = {
 
 import bpy
 
-from .atlas import build_body_atlas
+from .atlas import build_body_atlas, build_head_atlas
+from .head import chop_head
+from .look import add_outline, use_anime_shader
 from .merge import merge_gloves, selection_summary
 from .retarget import drape_cloth, retarget_to_pes, transfer_boneless_to_pes
 
@@ -183,6 +185,100 @@ class FMDLTOOLS_OT_drape_cloth(bpy.types.Operator):
 		return {"FINISHED"}
 
 
+class FMDLTOOLS_OT_chop_head(bpy.types.Operator):
+	bl_idname = "fmdltools.chop_head"
+	bl_label = "Chop head and hair"
+	bl_description = (
+		"Cut the head and the hair off the converted body. "
+		"The body mesh and every bone except sk_head are removed. "
+		"The head stays on the same sk_head joint. "
+		"face_high.fmdl from the PES19 head template is the collar"
+	)
+	bl_options = {"REGISTER", "UNDO"}
+
+	@classmethod
+	def poll(cls, context):
+		return bool(context.selected_objects)
+
+	def execute(self, context):
+		try:
+			result = chop_head(context)
+		except (ValueError, RuntimeError) as error:
+			self.report({"ERROR"}, str(error))
+			return {"CANCELLED"}
+		self.report(
+			{"INFO"},
+			"Chopped %d verts into %s. Skeleton is %s. The body was removed." % (
+				result["verts"], result["head"], ", ".join(result["bones"]),
+			),
+		)
+		return {"FINISHED"}
+
+
+class FMDLTOOLS_OT_outline(bpy.types.Operator):
+	bl_idname = "fmdltools.add_outline"
+	bl_label = "Add outline"
+	bl_description = (
+		"Duplicate the mesh into an inverse shell: merge the split edges, flip the normals, "
+		"and solidify with a negative thickness. The shell uses the unlit shader and is one-sided. "
+		"A vertex group named outline_skip is left out of the line. "
+		"The shell is applied into the mesh so the FMDL export includes it"
+	)
+	bl_options = {"REGISTER", "UNDO"}
+
+	thickness: bpy.props.FloatProperty(
+		name="Thickness",
+		description="Negative thickness. The shell grows outward after the normals are flipped",
+		default=-0.002,
+		min=-0.05,
+		max=-0.0001,
+	)
+
+	@classmethod
+	def poll(cls, context):
+		return bool(context.selected_objects)
+
+	def execute(self, context):
+		try:
+			result = add_outline(context, self.thickness)
+		except (ValueError, RuntimeError) as error:
+			self.report({"ERROR"}, str(error))
+			return {"CANCELLED"}
+		self.report(
+			{"INFO"},
+			"Added an outline on %s at thickness %.4f." % (
+				", ".join(result["shells"]), result["thickness"],
+			),
+		)
+		return {"FINISHED"}
+
+
+class FMDLTOOLS_OT_anime_shader(bpy.types.Operator):
+	bl_idname = "fmdltools.anime_shader"
+	bl_label = "Use anime shader"
+	bl_description = (
+		"Switch the selected mesh to the unlit constant shader from the shadeless PES head. "
+		"The texture is drawn as painted, without the blin light and specular that wash the color out"
+	)
+	bl_options = {"REGISTER", "UNDO"}
+
+	@classmethod
+	def poll(cls, context):
+		return bool(context.selected_objects)
+
+	def execute(self, context):
+		try:
+			result = use_anime_shader(context)
+		except (ValueError, RuntimeError) as error:
+			self.report({"ERROR"}, str(error))
+			return {"CANCELLED"}
+		self.report(
+			{"INFO"},
+			"Anime shader on %s." % ", ".join(result["materials"][:6]),
+		)
+		return {"FINISHED"}
+
+
 class FMDLTOOLS_OT_atlas(bpy.types.Operator):
 	bl_idname = "fmdltools.build_atlas"
 	bl_label = "Build body texture atlas"
@@ -211,10 +307,46 @@ class FMDLTOOLS_OT_atlas(bpy.types.Operator):
 		left_out = ""
 		if result.get("dropped"):
 			left_out = " Left out %s." % ", ".join(result["dropped"][:4])
+		if result.get("skipped"):
+			left_out += " Not a head or hair texture: %s." % ", ".join(result["skipped"][:4])
 		self.report(
 			{"INFO"},
 			"Packed %d texture(s) into %s. %s.%s%s%s" % (
 				result["textures"], result["dds"], sizes, skipped, left_out, note,
+			),
+		)
+		return {"FINISHED"}
+
+
+class FMDLTOOLS_OT_head_atlas(bpy.types.Operator):
+	bl_idname = "fmdltools.build_head_atlas"
+	bl_label = "Build head texture"
+	bl_description = (
+		"Pack the chopped head's face and hair into one 1024 head.dds and put that material on the mesh. "
+		"The body texture is left out. "
+		"Run it while the UVs still sit in each texture's own 0-1 space"
+	)
+	bl_options = {"REGISTER", "UNDO"}
+
+	@classmethod
+	def poll(cls, context):
+		return bool(context.selected_objects)
+
+	def execute(self, context):
+		try:
+			result = build_head_atlas(context)
+		except (ValueError, RuntimeError) as error:
+			self.report({"ERROR"}, str(error))
+			return {"CANCELLED"}
+		sizes = ", ".join("%s %d" % (name, dst) for name, _src, dst in result["slots"][:6])
+		note = (" " + result["note"]) if result["note"] else ""
+		left_out = ""
+		if result.get("skipped"):
+			left_out = " Not a head or hair texture: %s." % ", ".join(result["skipped"][:4])
+		self.report(
+			{"INFO"},
+			"Packed %d texture(s) into %s (%d). %s.%s%s" % (
+				result["textures"], result["dds"], result["size"], sizes, left_out, note,
 			),
 		)
 		return {"FINISHED"}
@@ -241,8 +373,12 @@ class FMDLTOOLS_PT_main(bpy.types.Panel):
 		layout.operator("fmdltools.retarget_pes", text="Convert existing Skeleton to PES Skeleton")
 		layout.operator("fmdltools.boneless_pes", text="Convert \U0001F171oneless Model to PES Skeleton")
 		layout.operator("fmdltools.drape_cloth", text="Drape cloth onto limbs")
+		layout.operator("fmdltools.chop_head", text="Chop head and hair")
+		layout.operator("fmdltools.add_outline", text="Add outline")
+		layout.operator("fmdltools.anime_shader", text="Use anime shader")
 		layout.separator()
 		layout.operator("fmdltools.build_atlas", text="Build body texture atlas")
+		layout.operator("fmdltools.build_head_atlas", text="Build head texture")
 
 
 CLASSES = (
@@ -251,7 +387,11 @@ CLASSES = (
 	FMDLTOOLS_OT_retarget_pes,
 	FMDLTOOLS_OT_boneless_pes,
 	FMDLTOOLS_OT_drape_cloth,
+	FMDLTOOLS_OT_chop_head,
+	FMDLTOOLS_OT_outline,
+	FMDLTOOLS_OT_anime_shader,
 	FMDLTOOLS_OT_atlas,
+	FMDLTOOLS_OT_head_atlas,
 	FMDLTOOLS_PT_main,
 )
 

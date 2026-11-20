@@ -21,6 +21,12 @@ Set the Medic FMDL path on the panel. A successful convert saves that path in Bl
 
 ## Patch notes
 
+### 1.6.0
+
+**Chop head and hair** removes the body and every bone except `sk_head`. The head stays on that joint. **Build head texture** packs the face and hair into a 1024 `head.dds` and assigns that material.
+
+**Add outline** builds the inverse shell: merge the split edges, flip the normals, solidify outward, and apply the shell so the export includes it. **Use anime shader** switches the mesh to the unlit `fox3dfw_constant_srgb_ndr_solid` shader from the shadeless PES head.
+
 ### 1.5.0
 
 **Rigged models scale on their bones first.** Convert existing Skeleton poses the skeleton that came with the mesh, then bakes it. The body is scaled once so the neck and the soles match the medic and the hip lines up. The limbs then rotate toward the next medic joint. Mesh matching is the fallback: it runs only if that posed body is still off the medic, and it is still the whole path for Convert boneless Model.

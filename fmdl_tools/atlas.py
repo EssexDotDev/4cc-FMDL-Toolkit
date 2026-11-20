@@ -46,17 +46,55 @@ def color_image(material):
 	return best
 
 
+def _is_head_mesh(obj):
+	if obj.get("fmdl_part") == "hair_high":
+		return True
+	parent = obj.parent
+	return parent is not None and parent.get("fmdl_part") == "hair_high"
+
+
 def _selected_meshes(context):
 	meshes = []
 	seen = set()
-	for obj in context.selected_objects:
+
+	def add(obj):
 		if obj.type != "MESH" or obj.name in seen:
-			continue
+			return
 		if obj.data.uv_layers.active is None:
-			continue
+			return
 		seen.add(obj.name)
 		meshes.append(obj)
+
+	for obj in context.selected_objects:
+		if obj.type == "EMPTY":
+			for child in obj.children:
+				add(child)
+			continue
+		add(obj)
 	return meshes
+
+
+# Words that mark a head or hair texture. The body, the clothes, and the
+# tail stay out of a head atlas.
+_HEAD_WORDS = (
+	"hair", "髪", "face", "顔", "head", "eye", "目", "mayu", "brow",
+	"lash", "mouth", "lip", "teeth", "tongue", "瞳",
+)
+_BODY_WORDS = ("body", "bdy", "skin", "cloth", "dress", "skirt", "tail", "体", "肌", "尾")
+
+
+def _is_head_texture(material_name, image_name):
+	"""True for a face, eye, brow, or hair map. A body or cloth map is not."""
+	material = (material_name or "").lower()
+	image = (image_name or "").lower()
+	text = material + " " + image
+	head = any(word in text for word in _HEAD_WORDS)
+	if not head:
+		return False
+	# The material name wins when a face map and a body word share a string.
+	if any(word in material for word in _HEAD_WORDS):
+		return True
+	return not any(word in text for word in _BODY_WORDS)
 
 
 def _uv_bounds(mesh_obj, material_index):
@@ -110,30 +148,31 @@ def _role(name):
 	return "other"
 
 
-def _cell_sizes(entries):
+def _cell_sizes(entries, sheet):
 	"""Power-of-two side length for each entry, already in priority order.
 
-	One texture fills the sheet. Up to four textures get 1024 each. Past that,
-	the body, the face, and the clothes are grown first and hair stays smaller.
+	One texture fills the sheet. Up to four textures take half the sheet.
+	Past that, the body, the face, and the clothes are grown first.
 	"""
 	count = len(entries)
 	if count == 1:
-		return [ATLAS]
+		return [sheet]
+	half = sheet // 2
 	if count <= 4:
-		return [1024] * count
+		return [half] * count
 	if count <= 16:
-		base = 512
+		base = max(half // 2, 64)
 	elif count <= 64:
-		base = 256
+		base = max(half // 4, 32)
 	else:
-		base = 128
+		base = max(half // 8, 32)
 	sizes = [base] * count
-	limit = ATLAS * ATLAS
+	limit = sheet * sheet
 	changed = True
 	while changed:
 		changed = False
 		for index, side in enumerate(sizes):
-			if side >= 1024:
+			if side >= half:
 				continue
 			grown = side * 2
 			used = sum(item * item for item in sizes) - side * side + grown * grown
@@ -144,12 +183,12 @@ def _cell_sizes(entries):
 	return sizes
 
 
-def _place(named_sizes):
+def _place(named_sizes, sheet):
 	"""Pack power-of-two squares. Returns rectangles and any name that did not fit."""
 	if not named_sizes:
 		return {}, []
 	step = min(size for _name, size in named_sizes)
-	cells = ATLAS // step
+	cells = sheet // step
 	taken = [[False] * cells for _ in range(cells)]
 	rects = {}
 	dropped = []
@@ -176,7 +215,7 @@ def _place(named_sizes):
 	return rects, dropped
 
 
-def assign_slots(named):
+def assign_slots(named, sheet=ATLAS):
 	"""Place each texture in a power-of-two cell. named is (name, used-uv area).
 
 	Returns the placed rectangles and the names that did not fit. Rectangles
@@ -184,8 +223,8 @@ def assign_slots(named):
 	"""
 	entries = [{"name": name, "role": _role(name), "area": area} for name, area in named]
 	entries.sort(key=lambda entry: (_RANK[entry["role"]], -entry["area"]))
-	sizes = _cell_sizes(entries)
-	rects, dropped = _place([(entry["name"], size) for entry, size in zip(entries, sizes)])
+	sizes = _cell_sizes(entries, sheet)
+	rects, dropped = _place([(entry["name"], size) for entry, size in zip(entries, sizes)], sheet)
 	return rects, dropped
 
 
@@ -240,20 +279,20 @@ def _crop_scale(image, bounds, pw, ph):
 	return out
 
 
-def _blit(dest, src, px, py, pw, ph):
+def _blit(dest, src, px, py, pw, ph, sheet):
 	for row in range(ph):
-		if py + row < 0 or py + row >= ATLAS:
+		if py + row < 0 or py + row >= sheet:
 			continue
-		width = min(pw, ATLAS - px)
+		width = min(pw, sheet - px)
 		if width <= 0:
 			continue
 		src_i = row * pw * 4
-		dest_i = ((py + row) * ATLAS + px) * 4
+		dest_i = ((py + row) * sheet + px) * 4
 		dest[dest_i:dest_i + width * 4] = src[src_i:src_i + width * 4]
 
 
-def _write_image(buf):
-	image = bpy.data.images.new("body_atlas", ATLAS, ATLAS, alpha=True, float_buffer=False)
+def _write_image(buf, sheet, name):
+	image = bpy.data.images.new(name, sheet, sheet, alpha=True, float_buffer=False)
 	image.colorspace_settings.name = "sRGB"
 	image.pixels.foreach_set(buf)
 	image.update()
@@ -261,21 +300,23 @@ def _write_image(buf):
 	return image
 
 
-def _move_uvs(mesh_obj, material_index, bounds, rect):
+def _move_uvs(mesh_obj, material_index, bounds, rect, sheet):
 	umin, vmin, umax, vmax = bounds
 	px, py, pw, ph = rect
-	sx = (pw / float(ATLAS)) / (umax - umin)
-	sy = (ph / float(ATLAS)) / (vmax - vmin)
-	ox = px / float(ATLAS) - umin * sx
-	oy = py / float(ATLAS) - vmin * sy
-	layer = mesh_obj.data.uv_layers.active
-	for poly in mesh_obj.data.polygons:
-		if poly.material_index != material_index:
-			continue
-		for loop in range(poly.loop_start, poly.loop_start + poly.loop_total):
-			uv = layer.data[loop].uv
-			uv.x = ox + uv.x * sx
-			uv.y = oy + uv.y * sy
+	sx = (pw / float(sheet)) / (umax - umin)
+	sy = (ph / float(sheet)) / (vmax - vmin)
+	ox = px / float(sheet) - umin * sx
+	oy = py / float(sheet) - vmin * sy
+	# Every UV map, not only the active one. The exporter can read a
+	# different layer than the one Blender is showing.
+	for layer in mesh_obj.data.uv_layers:
+		for poly in mesh_obj.data.polygons:
+			if poly.material_index != material_index:
+				continue
+			for loop in range(poly.loop_start, poly.loop_start + poly.loop_total):
+				uv = layer.data[loop].uv
+				uv.x = ox + uv.x * sx
+				uv.y = oy + uv.y * sy
 
 
 # The medic body is a blin material. PES paints the mesh red when that shader,
@@ -319,11 +360,11 @@ def _pes_blin(material):
 		pass
 
 
-def _body_material(mesh_obj, image):
-	"""One material named body: body.dds into Base Color, alpha 1, out to Surface."""
-	material = bpy.data.materials.get("body")
+def _single_material(mesh_obj, image, material_name, filename):
+	"""One blin material. The color map is the atlas the UVs were moved into."""
+	material = bpy.data.materials.get(material_name)
 	if material is None:
-		material = bpy.data.materials.new("body")
+		material = bpy.data.materials.new(material_name)
 	material.use_nodes = True
 	nodes = material.node_tree.nodes
 	links = material.node_tree.links
@@ -333,7 +374,7 @@ def _body_material(mesh_obj, image):
 	texture = nodes.new("ShaderNodeTexImage")
 	texture.image = image
 	texture.label = "Base_Tex_SRGB"
-	_tag_image(image, "body.dds", getattr(image, "fmdl_texture_directory", "") or "", "Base_Tex_SRGB")
+	_tag_image(image, filename, getattr(image, "fmdl_texture_directory", "") or "", "Base_Tex_SRGB")
 	shader.inputs["Alpha"].default_value = 1.0
 	texture.location = (-400, 300)
 	shader.location = (0, 300)
@@ -353,36 +394,28 @@ def _body_material(mesh_obj, image):
 	mesh_obj.data.materials.append(material)
 
 
-def _load_body_dds(dds_path, fallback):
+def _body_material(mesh_obj, image):
+	"""One material named body: body.dds into Base Color, alpha 1, out to Surface."""
+	_single_material(mesh_obj, image, "body", "body.dds")
+
+
+def _load_body_dds(dds_path, fallback, filename="body.dds"):
 	if dds_path and os.path.isfile(dds_path):
 		image = bpy.data.images.load(dds_path, check_existing=True)
-		image.name = "body.dds"
+		image.name = filename
 		return image
-	fallback.name = "body.dds"
+	fallback.name = filename
 	return fallback
 
 
-def _point_materials(meshes, atlas_image, packed_names):
-	seen = set()
-	for mesh_obj in meshes:
-		for material in mesh_obj.data.materials:
-			if material is None or material.name in seen or material.node_tree is None:
-				continue
-			seen.add(material.name)
-			for node in material.node_tree.nodes:
-				image = getattr(node, "image", None)
-				if image is not None and image.name in packed_names:
-					node.image = atlas_image
-
-
-def _save_dds(image, directory):
-	png_path = os.path.join(directory, "body.png")
-	dds_path = os.path.join(directory, "body.dds")
+def _save_dds(image, directory, stem="body"):
+	png_path = os.path.join(directory, stem + ".png")
+	dds_path = os.path.join(directory, stem + ".dds")
 	image.filepath_raw = png_path
 	image.file_format = "PNG"
 	image.save()
 	if not os.path.isfile(_NVTT):
-		return dds_path, "NVIDIA Texture Tools is not installed, so only body.png was written."
+		return dds_path, "NVIDIA Texture Tools is not installed, so only %s.png was written." % stem
 	# PES reads FourCC DXT5. bc3n-rxgb writes RXGB, and the compiler skips that.
 	command = [
 		_NVTT,
@@ -401,15 +434,20 @@ def _save_dds(image, directory):
 	return dds_path, ""
 
 
-def build_body_atlas(context):
-	"""Pack color textures into body.dds and move the active UV map to match."""
-	if context.object is not None and context.object.mode != "OBJECT":
-		bpy.ops.object.mode_set(mode="OBJECT")
-	meshes = _selected_meshes(context)
-	if not meshes:
-		raise ValueError("Select the mesh. It needs a UV map and a color texture on each material.")
+def _output_directory(users):
+	directory = bpy.path.abspath("//")
+	if not bpy.data.filepath or not os.path.isdir(directory):
+		directory = os.path.dirname(bpy.path.abspath(users[next(iter(users))]["image"].filepath))
+	if not directory or not os.path.isdir(directory):
+		directory = bpy.app.tempdir
+	return directory
+
+
+def _build_atlas(context, meshes, sheet, stem, material_name, head_only):
+	"""Pack the color maps, move every UV layer into the cells, then assign one material."""
 	users = {}
 	missing = []
+	skipped = []
 	for mesh_obj in meshes:
 		if mesh_obj.data.users > 1:
 			mesh_obj.data = mesh_obj.data.copy()
@@ -421,51 +459,76 @@ def build_body_atlas(context):
 			if image is None:
 				missing.append(material.name if material else mesh_obj.name)
 				continue
+			material_name_src = material.name if material else ""
+			if head_only and not _is_head_texture(material_name_src, image.name):
+				skipped.append(material_name_src or image.name)
+				continue
 			users.setdefault(image.name, {"image": image, "bounds": [], "slots": []})
 			users[image.name]["bounds"].append(bounds)
 			users[image.name]["slots"].append((mesh_obj, index))
 	if not users:
+		if head_only:
+			raise ValueError("This head has no face or hair texture to pack.")
 		raise ValueError("None of the selected materials have a color texture.")
 	named = []
 	for name, entry in users.items():
 		bounds = _union_bounds(entry["bounds"])
 		named.append((name, (bounds[2] - bounds[0]) * (bounds[3] - bounds[1])))
-	rects, dropped = assign_slots(named)
+	rects, dropped = assign_slots(named, sheet)
 	if not rects:
-		raise ValueError("The textures do not fit in a 2048 atlas.")
-	# The whole source image goes in the cell, the way the Photoshop layers do.
+		raise ValueError("The textures do not fit in a %d atlas." % sheet)
 	full = (0.0, 0.0, 1.0, 1.0)
-	dest = array.array("f", [0.8, 0.8, 0.8, 1.0]) * (ATLAS * ATLAS)
+	dest = array.array("f", [0.8, 0.8, 0.8, 1.0]) * (sheet * sheet)
 	report = []
 	for name, entry in users.items():
 		if name not in rects:
 			continue
 		px, py, pw, ph = rects[name]
 		chunk = _crop_scale(entry["image"], full, pw, ph)
-		_blit(dest, chunk, px, py, pw, ph)
+		_blit(dest, chunk, px, py, pw, ph, sheet)
 		report.append((entry["image"].name, int(entry["image"].size[0]), pw))
-	atlas = _write_image(dest)
+	atlas = _write_image(dest, sheet, stem + "_atlas")
 	for name, entry in users.items():
 		if name not in rects:
 			continue
 		for mesh_obj, index in entry["slots"]:
-			_move_uvs(mesh_obj, index, full, rects[name])
-	_point_materials(meshes, atlas, set(rects))
-	directory = bpy.path.abspath("//")
-	if not bpy.data.filepath or not os.path.isdir(directory):
-		directory = os.path.dirname(bpy.path.abspath(users[next(iter(users))]["image"].filepath))
-	if not directory or not os.path.isdir(directory):
-		directory = bpy.app.tempdir
-	dds_path, note = _save_dds(atlas, directory)
-	body_image = _load_body_dds(dds_path, atlas)
+			_move_uvs(mesh_obj, index, full, rects[name], sheet)
+	directory = _output_directory(users)
+	dds_path, note = _save_dds(atlas, directory, stem)
+	packed_image = _load_body_dds(dds_path, atlas, stem + ".dds")
+	if dds_path and os.path.isfile(dds_path):
+		packed_image.reload()
+	_tag_image(packed_image, stem + ".dds", "", "Base_Tex_SRGB")
 	for mesh_obj in meshes:
-		_body_material(mesh_obj, body_image)
+		_single_material(mesh_obj, packed_image, material_name, stem + ".dds")
 	return {
 		"textures": len(rects),
 		"missing": missing,
 		"dropped": dropped,
+		"skipped": skipped,
 		"slots": report,
 		"dds": dds_path,
 		"note": note,
-		"image": atlas.name,
+		"image": packed_image.name,
+		"size": sheet,
 	}
+
+
+def build_body_atlas(context):
+	"""Pack color textures into one 2048 body.dds and assign that material."""
+	if context.object is not None and context.object.mode != "OBJECT":
+		bpy.ops.object.mode_set(mode="OBJECT")
+	meshes = [mesh for mesh in _selected_meshes(context) if not _is_head_mesh(mesh)]
+	if not meshes:
+		raise ValueError("Select the body. The chopped head uses Build head texture.")
+	return _build_atlas(context, meshes, ATLAS, "body", "body", False)
+
+
+def build_head_atlas(context):
+	"""Pack the chopped head's face and hair into one 1024 head.dds."""
+	if context.object is not None and context.object.mode != "OBJECT":
+		bpy.ops.object.mode_set(mode="OBJECT")
+	meshes = [mesh for mesh in _selected_meshes(context) if _is_head_mesh(mesh)]
+	if not meshes:
+		raise ValueError("Select the chopped head.")
+	return _build_atlas(context, meshes, 1024, "head", "Head", True)
