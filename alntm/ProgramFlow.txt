@@ -1,0 +1,13 @@
+UI: Refer to UI Diagram.jpg for a rough visual guide
+Top Left: User selects which folder the team will be in
+Top Right: A Green "Make a team" Button
+
+Top Left next row: A model file is dragged in here, or the box is clicked on to open a Windows Explorer Dialogue, and the user selects which model is going to be ported
+
+To the right of the input row: A Linked ASCII input field where the user manually inputs the Boots ID for the player (refer to the 4cc compiler in B:\4cc\aesthetics\4cc-aet-compiler-red 3.4.0, and the example team B:\4cc\aesthetics\old\ALG Aesthetics Export VGL21 for folder layout)
+
+Once a model is dragged into one slot, a new row below is automatically generated. On the left of each row should be a red X to delete that row.
+
+Functionality: A Headless Blender session that imports the model, uses FDML Tools to convert the skeleton, create a texture atlas, then uses PES fmdl to export the fmdl into an appropriately named Boots folder within the user-selected team folder.
+
+Functionality UI: A progress bar somewhere that shows what's going on
